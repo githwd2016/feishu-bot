@@ -1,0 +1,20 @@
+{
+  "name": "feishu-gitcode-review-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Feishu to GitCode automated review and feedback loop",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test",
+    "check": "node --check src/index.js && node --check scripts/gitcode-api.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.55.0",
+    "dotenv": "^16.6.1"
+  }
+}
