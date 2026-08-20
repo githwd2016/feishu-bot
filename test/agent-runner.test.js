@@ -15,9 +15,14 @@ import {
   summarizeOpenCodeEvent,
 } from '../src/agent-runner.js';
 import { parsePrUrl } from '../src/pr.js';
+import { PROGRESS_HEARTBEAT_MS } from '../src/progress.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const execFileAsync = promisify(execFile);
+
+test('agent and Feishu progress heartbeats use the shared five-minute interval', () => {
+  assert.equal(PROGRESS_HEARTBEAT_MS, 5 * 60 * 1000);
+});
 
 test('AgentRunner runs codex in a temporary worktree and cleans it afterward', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'fake-codex-'));

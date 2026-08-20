@@ -1,0 +1,1 @@
+export const PROGRESS_HEARTBEAT_MS = 5 * 60 * 1000;
