@@ -3,6 +3,16 @@ import { KeyedQueue } from './keyed-queue.js';
 
 const BOT_PROTOCOL_PREFIX = 'review-bot';
 const BOT_PROTOCOL_PATTERN = /\[review-bot action=(request|result) mode=(initial|rereview) cycle=(\d+)(?: status=(success|failed))?\]/i;
+const COMPATIBLE_BOT_FAILURE_PATTERN = /(?:审查|复审|review).{0,16}(?:失败|出错|报错|无法完成|被阻塞|failed|error|blocked)/i;
+const COMPATIBLE_BOT_PROGRESS_PATTERN = /(?:正在|处理中|已收到|开始(?:审查|复审)|稍后|完成后|请(?:审查|复审))/i;
+const COMPATIBLE_BOT_SUCCESS_PATTERNS = [
+  /(?:审查|复审)(?:意见|评论)?.{0,8}(?:已提交|提交完成|已完成|完成|完毕)/i,
+  /已(?:完成|结束)(?:本次)?(?:审查|复审)/i,
+  /(?:意见|评论|inline\s+comments?|comments?).{0,8}(?:已提交|提交完成|已发布|发布完成)/i,
+  /(?:review).{0,8}(?:completed|done|finished|submitted)/i,
+  /(?:comments?).{0,8}(?:submitted|posted|completed)/i,
+  /未发现.{0,8}(?:问题|意见|评论)/i,
+];
 const FEISHU_PROGRESS_HEARTBEAT_MS = 5 * 60 * 1000;
 
 export class ReviewWorkflow {
@@ -160,15 +170,23 @@ export class ReviewWorkflow {
 
     const reviewer = this.config.reviewers.find((item) => item.openId === event.senderOpenId);
     if (reviewer) {
-      if (protocol?.action !== 'result') {
-        console.warn(`[workflow] 忽略 ${reviewer.id} 缺少结果标记的消息`);
-        return;
+      let success;
+      if (protocol?.action === 'result') {
+        if (protocol.cycle !== state.cycle) {
+          console.log(`[workflow] 忽略 ${reviewer.id} 的过期复审结果: cycle=${protocol.cycle}, current=${state.cycle}`);
+          return;
+        }
+        success = protocol.status !== 'failed';
+      } else {
+        const linkedPr = parsePrUrl(event.text);
+        const compatibleResult = parseCompatibleReviewBotResult(event.text);
+        if (!linkedPr || linkedPr.key !== pr.key || !compatibleResult) {
+          console.warn(`[workflow] 忽略 ${reviewer.id} 缺少结果标记的消息`);
+          return;
+        }
+        success = compatibleResult.status === 'success';
+        console.warn(`[workflow] 接收 ${reviewer.id} 的第三方兼容结果 status=${compatibleResult.status} pr=${pr.key}`);
       }
-      if (protocol.cycle !== state.cycle) {
-        console.log(`[workflow] 忽略 ${reviewer.id} 的过期复审结果: cycle=${protocol.cycle}, current=${state.cycle}`);
-        return;
-      }
-      const success = protocol?.status !== 'failed';
       await this.#recordReviewerOutcome(pr, reviewer.id, success,
         success ? undefined : `审查机器人 ${reviewer.name} 报告执行失败`);
       return;
@@ -333,6 +351,14 @@ export function parseReviewBotProtocol(text = '') {
     cycle: Number(match[3]),
     status: match[4]?.toLowerCase(),
   };
+}
+
+export function parseCompatibleReviewBotResult(text = '') {
+  const value = String(text);
+  if (COMPATIBLE_BOT_FAILURE_PATTERN.test(value)) return { status: 'failed' };
+  if (COMPATIBLE_BOT_PROGRESS_PATTERN.test(value)) return null;
+  if (COMPATIBLE_BOT_SUCCESS_PATTERNS.some((pattern) => pattern.test(value))) return { status: 'success' };
+  return null;
 }
 
 function inferReviewMode(text = '') {
