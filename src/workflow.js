@@ -1,5 +1,6 @@
 import { assertAllowedPr, parsePrUrl } from './pr.js';
 import { KeyedQueue } from './keyed-queue.js';
+import { PROGRESS_HEARTBEAT_MS } from './progress.js';
 
 const BOT_PROTOCOL_PREFIX = 'review-bot';
 const BOT_PROTOCOL_PATTERN = /\[review-bot action=(request|result) mode=(initial|rereview) cycle=(\d+)(?: status=(success|failed))?\]/i;
@@ -13,8 +14,6 @@ const COMPATIBLE_BOT_SUCCESS_PATTERNS = [
   /(?:comments?).{0,8}(?:submitted|posted|completed)/i,
   /未发现.{0,8}(?:问题|意见|评论)/i,
 ];
-const FEISHU_PROGRESS_HEARTBEAT_MS = 5 * 60 * 1000;
-
 export class ReviewWorkflow {
   constructor({ config, store, feishu, agent, gitcode }) {
     this.config = config;
@@ -306,7 +305,7 @@ export class ReviewWorkflow {
     const heartbeat = setInterval(() => {
       const elapsed = formatDuration(Date.now() - startedAt);
       void this.#sendProgress(chatId, `${action}，已运行 ${elapsed}：${pr.url}`);
-    }, FEISHU_PROGRESS_HEARTBEAT_MS);
+    }, PROGRESS_HEARTBEAT_MS);
     heartbeat.unref();
     try {
       return await task();

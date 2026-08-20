@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { PROGRESS_HEARTBEAT_MS } from './progress.js';
 import { WorktreeManager } from './worktree-manager.js';
 
 export class AgentRunner {
@@ -83,7 +84,7 @@ export class AgentRunner {
       const elapsed = Date.now() - startedAt;
       const remaining = Math.max(0, this.config.agent.timeoutMs - elapsed);
       console.log(`[agent:${backend}] 仍在运行 ${taskName} ${pr.key} elapsed=${formatDuration(elapsed)} remaining=${formatDuration(remaining)}`);
-    }, 60_000);
+    }, PROGRESS_HEARTBEAT_MS);
     heartbeat.unref();
 
     try {
