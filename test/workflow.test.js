@@ -7,6 +7,7 @@ import { StateStore } from '../src/state-store.js';
 import {
   ReviewWorkflow,
   buildReviewBotProtocol,
+  parseCompatibleReviewBotResult,
   parseReviewBotProtocol,
 } from '../src/workflow.js';
 
@@ -209,6 +210,70 @@ test('review bot protocol round-trips request and result metadata', () => {
   assert.deepEqual(parseReviewBotProtocol(`@机器人 ${marker} PR failed`), {
     action: 'result', mode: 'rereview', cycle: 3, status: 'failed',
   });
+});
+
+test('a configured third-party bot can report completion without the native protocol marker', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'review-third-party-result-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new StateStore(path.join(directory, 'state.json'));
+  await store.load();
+  const sent = [];
+  let summaryCalls = 0;
+  const workflow = new ReviewWorkflow({
+    config: {
+      feishu: { ownerOpenId: 'owner', ownerName: '何伟栋', botName: '何伟栋分身' },
+      gitcode: { allowedRepos: new Set(['qwren/opsbot']) },
+      reviewers: [
+        { id: 'hangdu-bot', name: 'hangdu-bot', openId: 'bot-hangdu', gitcodeLogin: 'hangdu', mode: 'feishu' },
+      ],
+      maxReviewCycles: 3,
+    },
+    store,
+    feishu: { send: async (...args) => sent.push(args) },
+    gitcode: {
+      unresolvedSummary: async () => {
+        summaryCalls += 1;
+        return { unresolvedCount: 0, unresolvedReviewerLogins: [] };
+      },
+    },
+    agent: {},
+  });
+
+  await workflow.onFeishuMessage({
+    messageId: 'third-party-owner', chatId: 'chat', senderOpenId: 'owner', senderType: 'user', messageType: 'text',
+    text: 'https://gitcode.com/qwren/opsbot/pull/127',
+  });
+  await waitFor(() => sent.some(isInitialRequest));
+
+  await workflow.onFeishuMessage({
+    messageId: 'third-party-progress', chatId: 'chat', senderOpenId: 'bot-hangdu', senderType: 'app', messageType: 'text',
+    text: '@何伟栋分身 已收到，正在审查：https://gitcode.com/qwren/opsbot/pull/127',
+  });
+  await tick();
+  assert.equal(store.getPr('qwren/opsbot#127').pending['hangdu-bot'], 'pending');
+
+  await workflow.onFeishuMessage({
+    messageId: 'third-party-no-link', chatId: 'chat', senderOpenId: 'bot-hangdu', senderType: 'app', messageType: 'text',
+    text: '@何伟栋分身 审查意见已提交',
+  });
+  await tick();
+  assert.equal(store.getPr('qwren/opsbot#127').pending['hangdu-bot'], 'pending', 'compatibility requires an explicit PR link');
+
+  await workflow.onFeishuMessage({
+    messageId: 'third-party-complete', chatId: 'chat', senderOpenId: 'bot-hangdu', senderType: 'app', messageType: 'text',
+    text: '@何伟栋分身 审查意见已提交：[https://gitcode.com/qwren/opsbot/pull/127](https://gitcode.com/qwren/opsbot/pull/127)',
+  });
+  await waitFor(() => store.getPr('qwren/opsbot#127').phase === 'completed');
+
+  assert.equal(summaryCalls, 1);
+  assert.ok(sent.some((item) => String(item[1]).includes('可以合入')));
+});
+
+test('third-party result compatibility distinguishes progress, success, and failure', () => {
+  assert.equal(parseCompatibleReviewBotResult('已收到，正在审查'), null);
+  assert.deepEqual(parseCompatibleReviewBotResult('审查意见已提交'), { status: 'success' });
+  assert.deepEqual(parseCompatibleReviewBotResult('本次复审执行失败'), { status: 'failed' });
+  assert.equal(parseCompatibleReviewBotResult('请审查并提交 inline comments'), null);
 });
 
 test('first-start mode reports how to bind the owner without running a review', async (t) => {

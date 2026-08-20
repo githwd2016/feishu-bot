@@ -453,6 +453,8 @@ PR 所有人 @自己的 bot + PR URL
 
 服务会按飞书 `message_id` 去重，并忽略重复结果、非当前轮次结果以及未配置机器人的状态消息。reviewer 的“已收到”进度消息不会 @ 发起机器人，只有完成或失败时才回 @，避免提前推进状态机。
 
+如果 reviewer 是第三方机器人，无法输出上述标记，也可以返回包含同一 PR 链接的明确结果，例如“审查意见已提交”“审查完成”或“审查失败”。兼容结果只接受 `REVIEWERS_JSON` 中当前等待的机器人 open_id；“已收到”“正在审查”等过程消息仍会忽略。第三方消息没有 cycle 信息，因此自有机器人仍推荐使用上面的严格标记协议。
+
 ### Codex 与 OpenCode 的差异
 
 - Codex 优先使用已安装的 GitCode 插件读取 PR、diff、commits、comments，并创建 inline comments；当前插件缺失的 discussion reply 和 resolved 操作使用安全 helper 补齐。
