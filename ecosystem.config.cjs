@@ -1,6 +1,6 @@
 module.exports = {
   apps: [{
-    name: 'feishu-gitcode-review-bot',
+    name: 'feishu-bot',
     script: 'src/index.js',
     cwd: __dirname,
     instances: 1,
