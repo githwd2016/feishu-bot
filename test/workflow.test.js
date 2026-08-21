@@ -205,6 +205,46 @@ test('a bot-authored review request is reviewed and only the final result mentio
   assert.match(sent[1][1], /action=result mode=rereview cycle=2 status=success/);
 });
 
+test('plain external review requests advance and persist the rereview cycle', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'review-external-cycle-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const stateFile = path.join(directory, 'state.json');
+  const sent = [];
+  const config = {
+    feishu: { ownerOpenId: 'owner', ownerName: '张三', botName: '张三bot' },
+    gitcode: { allowedRepos: new Set(['org/repo']) },
+    reviewers: [{ id: 'lisi', name: '李四bot', openId: 'bot-lisi', mode: 'feishu' }],
+    maxReviewCycles: 3,
+  };
+  const makeWorkflow = async () => {
+    const store = new StateStore(stateFile);
+    await store.load();
+    return new ReviewWorkflow({
+      config,
+      store,
+      feishu: { send: async (...args) => sent.push(args) },
+      gitcode: {},
+      agent: {
+        runReview: async () => ({ result: { unresolvedCount: 0, unresolvedReviewerLogins: [] } }),
+      },
+    });
+  };
+  const request = (workflow, messageId, text) => workflow.onFeishuMessage({
+    messageId, chatId: 'chat', senderOpenId: 'external-user', senderType: 'user', messageType: 'text', text,
+  });
+
+  let workflow = await makeWorkflow();
+  await request(workflow, 'external-initial', '请审查 https://gitcode.com/org/repo/pull/10');
+  await waitFor(() => sent.some((item) => /action=result mode=initial cycle=0/.test(String(item[1]))));
+
+  await request(workflow, 'external-rereview-1', '请复审 https://gitcode.com/org/repo/pull/10');
+  await waitFor(() => sent.some((item) => /action=result mode=rereview cycle=1/.test(String(item[1]))));
+
+  workflow = await makeWorkflow();
+  await request(workflow, 'external-rereview-2', '请再次复审 https://gitcode.com/org/repo/pull/10');
+  await waitFor(() => sent.some((item) => /action=result mode=rereview cycle=2/.test(String(item[1]))));
+});
+
 test('review bot protocol round-trips request and result metadata', () => {
   const marker = buildReviewBotProtocol({ action: 'result', mode: 'rereview', cycle: 3, status: 'failed' });
   assert.deepEqual(parseReviewBotProtocol(`@机器人 ${marker} PR failed`), {

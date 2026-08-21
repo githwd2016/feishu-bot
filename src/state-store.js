@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-const EMPTY = { version: 2, prs: {}, seenMessageIds: [] };
+const EMPTY = { version: 3, prs: {}, externalReviewCycles: {}, seenMessageIds: [] };
 
 export class StateStore {
   #file;
@@ -18,6 +18,7 @@ export class StateStore {
       this.#state = {
         version: EMPTY.version,
         prs: saved.prs || {},
+        externalReviewCycles: saved.externalReviewCycles || {},
         seenMessageIds: saved.seenMessageIds || [],
       };
     } catch (error) {
@@ -47,6 +48,20 @@ export class StateStore {
       state.seenMessageIds.push(messageId);
       state.seenMessageIds = state.seenMessageIds.slice(-500);
       return true;
+    });
+  }
+
+  async claimExternalReviewCycle({ prKey, chatId, requesterOpenId, mode, cycle }) {
+    return this.#mutate((state) => {
+      const key = JSON.stringify([prKey, chatId, requesterOpenId]);
+      const current = state.externalReviewCycles[key];
+      const next = Number.isInteger(cycle)
+        ? cycle
+        : mode === 'rereview'
+          ? Math.max(1, (Number.isInteger(current) ? current : 0) + 1)
+          : 0;
+      state.externalReviewCycles[key] = next;
+      return next;
     });
   }
 

@@ -13,6 +13,12 @@ test('StateStore persists PR state and de-duplicates messages', async (t) => {
   await store.load();
   assert.equal(await store.claimMessage('m1'), true);
   assert.equal(await store.claimMessage('m1'), false);
+  assert.equal(await store.claimExternalReviewCycle({
+    prKey: 'a/b#1', chatId: 'c1', requesterOpenId: 'user', mode: 'initial',
+  }), 0);
+  assert.equal(await store.claimExternalReviewCycle({
+    prKey: 'a/b#1', chatId: 'c1', requesterOpenId: 'user', mode: 'rereview',
+  }), 1);
   await store.putPr({ key: 'a/b#1', url: 'https://gitcode.com/a/b/pull/1', chatId: 'c1', phase: 'awaiting_review' });
 
   const reloaded = new StateStore(file);
@@ -20,4 +26,7 @@ test('StateStore persists PR state and de-duplicates messages', async (t) => {
   assert.equal(reloaded.getPr('a/b#1').chatId, 'c1');
   assert.deepEqual(reloaded.listPrs().map((item) => item.key), ['a/b#1']);
   assert.equal(await reloaded.claimMessage('m1'), false);
+  assert.equal(await reloaded.claimExternalReviewCycle({
+    prKey: 'a/b#1', chatId: 'c1', requesterOpenId: 'user', mode: 'rereview',
+  }), 2);
 });
