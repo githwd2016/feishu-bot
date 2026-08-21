@@ -267,7 +267,13 @@ export class ReviewWorkflow {
 
   async #reviewForExternalRequester(pr, event, protocol) {
     const mode = protocol?.action === 'request' ? protocol.mode : inferReviewMode(event.text);
-    const cycle = protocol?.cycle ?? 0;
+    const cycle = await this.store.claimExternalReviewCycle({
+      prKey: pr.key,
+      chatId: event.chatId,
+      requesterOpenId: event.senderOpenId,
+      mode,
+      cycle: protocol?.cycle,
+    });
     const requesterIsBot = isBotSender(event, protocol);
     const requester = this.#person(event.senderOpenId, requesterIsBot ? '发起机器人' : '发起人');
     await this.#sendProgress(event.chatId, `已收到，正在${mode === 'rereview' ? '复审' : '审查'}，耗时较长时会定期报告进度：${pr.url}`,
