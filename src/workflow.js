@@ -80,13 +80,18 @@ export class ReviewWorkflow {
       return;
     }
 
+    const owned = this.store.getPr(pr.key);
+    if (!owned && isBotSender(event, protocol) && protocol?.action !== 'request') {
+      console.warn(`[workflow] 忽略无对应任务的机器人状态消息 sender=${event.senderOpenId} pr=${pr.key}`);
+      return;
+    }
+
     if (event.senderOpenId === this.config.feishu.ownerOpenId) {
       this.queue.enqueue(pr.key, () => this.#startOwnedReview(pr, event))
         .catch((error) => this.#reportFailure(event.chatId, pr, error));
       return;
     }
 
-    const owned = this.store.getPr(pr.key);
     const task = owned
       ? () => this.#handleOwnedPrSignal(pr, event, protocol)
       : () => this.#reviewForExternalRequester(pr, event, protocol);
