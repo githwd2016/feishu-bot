@@ -237,6 +237,72 @@ test('an orphan bot result is ignored instead of starting another review', async
   assert.equal(store.getPr('org/repo#9'), null);
 });
 
+test('a plain bot-authored request with explicit review intent is not mistaken for an orphan result', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'review-plain-bot-request-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new StateStore(path.join(directory, 'state.json'));
+  await store.load();
+  const sent = [];
+  let reviewCalls = 0;
+  const workflow = new ReviewWorkflow({
+    config: {
+      feishu: { ownerOpenId: 'human-owner', ownerName: '李四', botName: '李四bot' },
+      gitcode: { allowedRepos: new Set(['org/repo']) },
+      reviewers: [{ id: 'owner-bot', name: '张三bot', openId: 'bot-owner', mode: 'feishu' }],
+      maxReviewCycles: 3,
+    },
+    store,
+    feishu: { send: async (...args) => sent.push(args) },
+    gitcode: {},
+    agent: {
+      runReview: async () => {
+        reviewCalls += 1;
+        return { result: { unresolvedCount: 0, unresolvedReviewerLogins: [] } };
+      },
+    },
+  });
+
+  await workflow.onFeishuMessage({
+    messageId: 'plain-bot-request', chatId: 'chat', senderOpenId: 'bot-owner', senderType: 'app',
+    messageType: 'text', text: '@李四bot 请审查 https://gitcode.com/org/repo/pull/9',
+  });
+  await waitFor(() => sent.length === 2);
+
+  assert.equal(reviewCalls, 1);
+  assert.match(sent[1][1], /action=result mode=initial cycle=0 status=success/);
+  assert.equal(sent[1][2][0].openId, 'bot-owner');
+});
+
+test('a plain orphan bot progress message is still ignored', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'review-orphan-progress-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new StateStore(path.join(directory, 'state.json'));
+  await store.load();
+  const sent = [];
+  let reviewCalls = 0;
+  const workflow = new ReviewWorkflow({
+    config: {
+      feishu: { ownerOpenId: 'human-owner', ownerName: '李四', botName: '李四bot' },
+      gitcode: { allowedRepos: new Set(['org/repo']) },
+      reviewers: [{ id: 'owner-bot', name: '张三bot', openId: 'bot-owner', mode: 'feishu' }],
+      maxReviewCycles: 3,
+    },
+    store,
+    feishu: { send: async (...args) => sent.push(args) },
+    gitcode: {},
+    agent: { runReview: async () => { reviewCalls += 1; } },
+  });
+
+  await workflow.onFeishuMessage({
+    messageId: 'orphan-progress', chatId: 'chat', senderOpenId: 'bot-owner', senderType: 'app',
+    messageType: 'text', text: '已收到，正在审查：https://gitcode.com/org/repo/pull/9',
+  });
+  await tick();
+
+  assert.equal(reviewCalls, 0);
+  assert.deepEqual(sent, []);
+});
+
 test('plain external review requests advance and persist the rereview cycle', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'review-external-cycle-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));

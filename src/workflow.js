@@ -6,6 +6,7 @@ const BOT_PROTOCOL_PREFIX = 'review-bot';
 const BOT_PROTOCOL_PATTERN = /\[review-bot action=(request|result) mode=(initial|rereview) cycle=(\d+)(?: status=(success|failed))?\]/i;
 const COMPATIBLE_BOT_FAILURE_PATTERN = /(?:审查|复审|review).{0,16}(?:失败|出错|报错|无法完成|被阻塞|failed|error|blocked)/i;
 const COMPATIBLE_BOT_PROGRESS_PATTERN = /(?:正在|处理中|已收到|开始(?:审查|复审)|稍后|完成后|请(?:审查|复审))/i;
+const COMPATIBLE_BOT_REQUEST_PATTERN = /(?:请|麻烦|帮忙|协助).{0,16}(?:审查|复审|review)|please.{0,16}(?:review|re-review)/i;
 const COMPATIBLE_BOT_SUCCESS_PATTERNS = [
   /(?:审查|复审)(?:意见|评论)?.{0,8}(?:已提交|提交完成|已完成|完成|完毕)/i,
   /已(?:完成|结束)(?:本次)?(?:审查|复审)/i,
@@ -81,7 +82,7 @@ export class ReviewWorkflow {
     }
 
     const owned = this.store.getPr(pr.key);
-    if (!owned && isBotSender(event, protocol) && protocol?.action !== 'request') {
+    if (!owned && isBotSender(event, protocol) && !isReviewRequest(event.text, protocol)) {
       console.warn(`[workflow] 忽略无对应任务的机器人状态消息 sender=${event.senderOpenId} pr=${pr.key}`);
       return;
     }
@@ -377,6 +378,11 @@ function inferReviewMode(text = '') {
 
 function isOpenIdRequest(text = '') {
   return /获取(?:我的)?\s*open[_ -]?id/i.test(String(text));
+}
+
+function isReviewRequest(text, protocol) {
+  if (protocol) return protocol.action === 'request';
+  return COMPATIBLE_BOT_REQUEST_PATTERN.test(String(text));
 }
 
 function isBotSender(event, protocol) {
