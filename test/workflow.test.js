@@ -237,7 +237,7 @@ test('an orphan bot result is ignored instead of starting another review', async
   assert.equal(store.getPr('org/repo#9'), null);
 });
 
-test('plain bot-authored review and bare rereview requests are not mistaken for orphan results', async (t) => {
+test('plain bot review, resolved-feedback, and bare rereview requests are accepted', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'review-plain-bot-request-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const store = new StateStore(path.join(directory, 'state.json'));
@@ -273,14 +273,25 @@ test('plain bot-authored review and bare rereview requests are not mistaken for 
   assert.equal(sent[1][2][0].openId, 'bot-owner');
 
   await workflow.onFeishuMessage({
-    messageId: 'plain-bot-rereview', chatId: 'chat', senderOpenId: 'bot-owner', senderType: 'app',
-    messageType: 'text', text: '@李四bot 复审 https://gitcode.com/org/repo/pull/9',
+    messageId: 'feedback-resolved', chatId: 'chat', senderOpenId: 'bot-owner', senderType: 'app',
+    messageType: 'text',
+    text: '@李四bot 审查意见已解决：[https://gitcode.com/org/repo/pull/9](https://gitcode.com/org/repo/pull/9)',
   });
   await waitFor(() => sent.length === 4);
 
   assert.equal(reviewCalls, 2);
   assert.match(sent[3][1], /action=result mode=rereview cycle=1 status=success/);
   assert.equal(sent[3][2][0].openId, 'bot-owner');
+
+  await workflow.onFeishuMessage({
+    messageId: 'plain-bot-rereview', chatId: 'chat', senderOpenId: 'bot-owner', senderType: 'app',
+    messageType: 'text', text: '@李四bot 复审 https://gitcode.com/org/repo/pull/9',
+  });
+  await waitFor(() => sent.length === 6);
+
+  assert.equal(reviewCalls, 3);
+  assert.match(sent[5][1], /action=result mode=rereview cycle=2 status=success/);
+  assert.equal(sent[5][2][0].openId, 'bot-owner');
 });
 
 test('a plain orphan bot progress message is still ignored', async (t) => {
