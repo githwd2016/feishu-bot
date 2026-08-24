@@ -7,6 +7,7 @@ const BOT_PROTOCOL_PATTERN = /\[review-bot action=(request|result) mode=(initial
 const COMPATIBLE_BOT_FAILURE_PATTERN = /(?:审查|复审|review).{0,16}(?:失败|出错|报错|无法完成|被阻塞|failed|error|blocked)/i;
 const COMPATIBLE_BOT_PROGRESS_PATTERN = /(?:正在|处理中|已收到|开始(?:审查|复审)|稍后|完成后|请(?:审查|复审))/i;
 const COMPATIBLE_BOT_REQUEST_PATTERN = /(?:请|麻烦|帮忙|协助).{0,16}(?:审查|复审|review)|please.{0,16}(?:review|re-review)/i;
+const COMPATIBLE_BOT_BARE_REQUEST_PATTERN = /(?:再次|重新|继续)?(?:审查|复审)(?:一下)?[\s:：，,]*(?:https?:\/\/|\[https?:\/\/)|(?:re-?review|review(?:\s+again)?)[\s:：,]*(?:https?:\/\/|\[https?:\/\/)/i;
 const COMPATIBLE_BOT_SUCCESS_PATTERNS = [
   /(?:审查|复审)(?:意见|评论)?.{0,8}(?:已提交|提交完成|已完成|完成|完毕)/i,
   /已(?:完成|结束)(?:本次)?(?:审查|复审)/i,
@@ -382,7 +383,12 @@ function isOpenIdRequest(text = '') {
 
 function isReviewRequest(text, protocol) {
   if (protocol) return protocol.action === 'request';
-  return COMPATIBLE_BOT_REQUEST_PATTERN.test(String(text));
+  const value = String(text);
+  if (COMPATIBLE_BOT_FAILURE_PATTERN.test(value)) return false;
+  if (COMPATIBLE_BOT_SUCCESS_PATTERNS.some((pattern) => pattern.test(value))) return false;
+  if (COMPATIBLE_BOT_REQUEST_PATTERN.test(value)) return true;
+  if (COMPATIBLE_BOT_PROGRESS_PATTERN.test(value)) return false;
+  return COMPATIBLE_BOT_BARE_REQUEST_PATTERN.test(value);
 }
 
 function isBotSender(event, protocol) {
