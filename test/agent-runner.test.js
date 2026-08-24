@@ -126,6 +126,46 @@ process.stdout.write(JSON.stringify({ type: 'text', part: { type: 'text', text: 
   assert.equal(output.sessionId, 'opencode-session-test');
 });
 
+test('AgentRunner reports a missing Codex final result without exposing a temporary path', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'fake-codex-no-result-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const fakeCodex = path.join(directory, 'codex');
+  const observedPath = path.join(directory, 'observed-output-path.txt');
+  await fs.writeFile(fakeCodex, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const output = args[args.indexOf('--output-last-message') + 1];
+fs.writeFileSync(${JSON.stringify(observedPath)}, output);
+process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'codex-missing-result' }) + '\\n');
+`, { mode: 0o755 });
+  const runner = new AgentRunner({
+    projectRoot,
+    gitcode: {
+      token: 'test-token', apiBase: 'https://api.gitcode.com/api/v5',
+      allowedRepos: new Set(['org/repo']), workdirs: {},
+    },
+    agent: {
+      backend: 'codex', timeoutMs: 5000,
+      codex: { bin: fakeCodex, model: '', profile: '', bypassApprovalsAndSandbox: false },
+      opencode: { bin: 'opencode', model: '', agent: '', variant: '', autoApprove: false },
+    },
+  });
+
+  await assert.rejects(
+    runner.runReview({
+      pr: parsePrUrl('https://gitcode.com/org/repo/pull/9'), mode: 'initial', reviewerName: '测试bot',
+    }),
+    (error) => {
+      assert.match(error.message, /codex 已结束但未生成最终结果/);
+      assert.match(error.message, /session codex-missing-result/);
+      assert.doesNotMatch(error.message, /last-message\.json|ENOENT|\/var\/folders/);
+      return true;
+    },
+  );
+  const outputPath = await fs.readFile(observedPath, 'utf8');
+  await assert.rejects(fs.access(path.dirname(outputPath)));
+});
+
 test('progress summaries never include agent text, commands, or tool arguments', () => {
   assert.equal(summarizeCodexEvent({
     type: 'item.started',

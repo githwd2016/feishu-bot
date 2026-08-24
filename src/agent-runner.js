@@ -143,10 +143,24 @@ export class AgentRunner {
         timeoutMs: this.config.agent.timeoutMs,
         onStdout: progress.write,
       });
+      let resultText;
+      try {
+        resultText = await fs.readFile(outputPath, 'utf8');
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        const session = progress.sessionId ? `（session ${progress.sessionId}）` : '';
+        throw new Error(`codex 已结束但未生成最终结果${session}，请查看当前机器人日志中的 Codex 事件`);
+      }
+      let result;
+      try {
+        result = JSON.parse(resultText);
+      } catch {
+        throw new Error('codex 生成的最终结果不是有效 JSON');
+      }
       return {
         ...logs,
         sessionId: progress.sessionId,
-        result: JSON.parse(await fs.readFile(outputPath, 'utf8')),
+        result,
       };
     } finally {
       progress.flush();
