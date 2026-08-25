@@ -135,6 +135,7 @@ export class AgentRunner {
     const progress = createJsonEventProgress({
       prefix: `[agent:codex:${pr.key}]`,
       summarize: summarizeCodexEvent,
+      terminalFailure: codexTerminalFailure,
     });
 
     try {
@@ -221,8 +222,40 @@ function runProcess({ bin, args, cwd, env, stdin, timeoutMs, onStdout, onStderr 
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let terminalError;
+    let settled = false;
     let forceKillTimer;
+    let exitDrainTimer;
+    const settle = (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(forceKillTimer);
+      clearTimeout(exitDrainTimer);
+      if (timedOut) {
+        reject(new Error(`${path.basename(bin)} 运行超过 ${formatDuration(timeoutMs)}，已终止`));
+        return;
+      }
+      if (terminalError) {
+        reject(terminalError);
+        return;
+      }
+      if (code === 0) {
+        resolve({ stdout, stderr });
+        return;
+      }
+      reject(new Error(`${path.basename(bin)} 退出异常 code=${code} signal=${signal || '-'} stderr=${stderr.slice(-2000)}`));
+    };
+    const stopForTerminalError = (error) => {
+      if (!(error instanceof Error) || terminalError || timedOut || settled) return;
+      terminalError = error;
+      console.error(`[agent:process] ${path.basename(bin)} 报告终态失败，正在终止进程组`);
+      terminateProcessTree(child, 'SIGTERM');
+      forceKillTimer = setTimeout(() => terminateProcessTree(child, 'SIGKILL'), 10_000);
+      forceKillTimer.unref();
+    };
     const timer = setTimeout(() => {
+      if (settled) return;
       timedOut = true;
       console.error(`[agent:process] ${path.basename(bin)} 超过 ${formatDuration(timeoutMs)}，正在终止进程组`);
       terminateProcessTree(child, 'SIGTERM');
@@ -231,7 +264,7 @@ function runProcess({ bin, args, cwd, env, stdin, timeoutMs, onStdout, onStderr 
     }, timeoutMs);
     child.stdout.on('data', (chunk) => {
       stdout = appendBounded(stdout, chunk);
-      onStdout?.(chunk.toString());
+      stopForTerminalError(onStdout?.(chunk.toString()));
     });
     child.stderr.on('data', (chunk) => {
       stderr = appendBounded(stderr, chunk);
@@ -243,19 +276,26 @@ function runProcess({ bin, args, cwd, env, stdin, timeoutMs, onStdout, onStderr 
       });
     }
     child.on('error', (error) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       clearTimeout(forceKillTimer);
+      clearTimeout(exitDrainTimer);
       reject(error);
     });
-    child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      clearTimeout(forceKillTimer);
-      if (code === 0) return resolve({ stdout, stderr });
-      if (timedOut) {
-        return reject(new Error(`${path.basename(bin)} 运行超过 ${formatDuration(timeoutMs)}，已终止`));
-      }
-      reject(new Error(`${path.basename(bin)} 退出异常 code=${code} signal=${signal || '-'} stderr=${stderr.slice(-2000)}`));
+    child.on('exit', (code, signal) => {
+      // Descendants can inherit stdout/stderr and keep Node's `close` event from
+      // firing after the actual CLI process has exited. Give the pipes a short
+      // drain window, then clean up the orphaned process group and use the main
+      // process exit status instead of waiting until the task timeout.
+      exitDrainTimer = setTimeout(() => {
+        if (settled) return;
+        console.warn(`[agent:process] ${path.basename(bin)} 主进程已退出但输出管道未关闭，正在清理遗留进程组`);
+        terminateProcessTree(child, 'SIGKILL');
+        settle(code, signal);
+      }, 1_000);
     });
+    child.on('close', settle);
     if (child.stdin) child.stdin.end(stdin);
   });
 }
@@ -269,9 +309,10 @@ function terminateProcessTree(child, signal) {
   }
 }
 
-function createJsonEventProgress({ prefix, summarize }) {
+function createJsonEventProgress({ prefix, summarize, terminalFailure }) {
   let pending = '';
   let sessionId = null;
+  let terminalError = null;
   const emitted = new Set();
   const consume = (line) => {
     if (!line.trim()) return;
@@ -285,6 +326,13 @@ function createJsonEventProgress({ prefix, summarize }) {
     if (!sessionId && discoveredSessionId) {
       sessionId = discoveredSessionId;
       console.log(`${prefix} 会话已保存 session=${sessionId}`);
+    }
+    if (!terminalError) {
+      const failure = terminalFailure?.(event);
+      if (failure) {
+        const session = sessionId ? `（session ${sessionId}）` : '';
+        terminalError = new Error(`${failure}${session}`);
+      }
     }
     const message = summarize(event);
     if (!message || emitted.has(message)) return;
@@ -300,12 +348,17 @@ function createJsonEventProgress({ prefix, summarize }) {
       const lines = pending.split('\n');
       pending = lines.pop() || '';
       for (const line of lines) consume(line);
+      return terminalError;
     },
     flush() {
       if (pending) consume(pending);
       pending = '';
     },
   };
+}
+
+function codexTerminalFailure(event) {
+  return event?.type === 'turn.failed' ? 'codex 模型报告执行失败' : null;
 }
 
 function extractAgentSessionId(event) {
@@ -324,7 +377,8 @@ function extractAgentSessionId(event) {
 export function summarizeCodexEvent(event) {
   if (event?.type === 'turn.started') return '模型开始处理';
   if (event?.type === 'turn.completed') return '模型处理完成，正在校验结果';
-  if (event?.type === 'turn.failed' || event?.type === 'error') return '模型报告执行失败';
+  if (event?.type === 'turn.failed') return '模型报告执行失败';
+  if (event?.type === 'error') return '模型报告错误，等待 Codex 重试或退出';
   if (!event?.type?.startsWith('item.') || !event.item) return null;
   const failed = ['failed', 'error'].includes(event.item.status);
   if (failed && event.item.type === 'command_execution') return '命令或测试执行失败';

@@ -166,6 +166,68 @@ process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'codex-
   await assert.rejects(fs.access(path.dirname(outputPath)));
 });
 
+test('AgentRunner stops immediately when Codex reports turn.failed', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'fake-codex-turn-failed-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const fakeCodex = path.join(directory, 'codex');
+  await fs.writeFile(fakeCodex, `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'codex-turn-failed' }) + '\\n');
+process.stdout.write(JSON.stringify({ type: 'turn.failed' }) + '\\n');
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+  const runner = codexRunner(fakeCodex, 10_000);
+  const startedAt = Date.now();
+
+  await assert.rejects(
+    runner.runReview({
+      pr: parsePrUrl('https://gitcode.com/org/repo/pull/9'), mode: 'initial', reviewerName: '测试bot',
+    }),
+    /codex 模型报告执行失败（session codex-turn-failed）/,
+  );
+  assert.ok(Date.now() - startedAt < 3_000, 'turn.failed should not wait for the task timeout');
+});
+
+test('AgentRunner does not wait for inherited pipes after the Codex process exits', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'fake-codex-leaked-pipe-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const fakeCodex = path.join(directory, 'codex');
+  await fs.writeFile(fakeCodex, `#!/usr/bin/env node
+const { spawn } = require('node:child_process');
+const descendant = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'inherit' });
+descendant.unref();
+process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: 'codex-leaked-pipe' }) + '\\n');
+process.stdout.write(JSON.stringify({ type: 'error', message: 'request failed' }) + '\\n');
+`, { mode: 0o755 });
+  const runner = codexRunner(fakeCodex, 10_000);
+  const startedAt = Date.now();
+
+  await assert.rejects(
+    runner.runReview({
+      pr: parsePrUrl('https://gitcode.com/org/repo/pull/9'), mode: 'initial', reviewerName: '测试bot',
+    }),
+    /codex 已结束但未生成最终结果（session codex-leaked-pipe）/,
+  );
+  assert.ok(Date.now() - startedAt < 4_000, 'an exited main process should not wait for inherited pipes');
+});
+
+test('AgentRunner preserves a timeout error when Codex exits cleanly after SIGTERM', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'fake-codex-timeout-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const fakeCodex = path.join(directory, 'codex');
+  await fs.writeFile(fakeCodex, `#!/usr/bin/env node
+process.on('SIGTERM', () => process.exit(0));
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+  const runner = codexRunner(fakeCodex, 500);
+
+  await assert.rejects(
+    runner.runReview({
+      pr: parsePrUrl('https://gitcode.com/org/repo/pull/9'), mode: 'initial', reviewerName: '测试bot',
+    }),
+    /codex 运行超过 1s，已终止/,
+  );
+});
+
 test('progress summaries never include agent text, commands, or tool arguments', () => {
   assert.equal(summarizeCodexEvent({
     type: 'item.started',
@@ -175,6 +237,9 @@ test('progress summaries never include agent text, commands, or tool arguments',
     type: 'item.completed',
     item: { type: 'agent_message', text: 'very long private agent output' },
   }), null);
+  assert.equal(summarizeCodexEvent({
+    type: 'error', message: 'private provider error',
+  }), '模型报告错误，等待 Codex 重试或退出');
   assert.equal(summarizeOpenCodeEvent({
     type: 'tool_use',
     part: { input: { token: 'secret' } },
@@ -205,4 +270,19 @@ test('OpenCode export fallback finds the last structured assistant text', () => 
 
 function git(cwd, ...args) {
   return execFileAsync('git', args, { cwd, encoding: 'utf8' });
+}
+
+function codexRunner(bin, timeoutMs) {
+  return new AgentRunner({
+    projectRoot,
+    gitcode: {
+      token: 'test-token', apiBase: 'https://api.gitcode.com/api/v5',
+      allowedRepos: new Set(['org/repo']), workdirs: {},
+    },
+    agent: {
+      backend: 'codex', timeoutMs,
+      codex: { bin, model: '', profile: '', bypassApprovalsAndSandbox: false },
+      opencode: { bin: 'opencode', model: '', agent: '', variant: '', autoApprove: false },
+    },
+  });
 }
