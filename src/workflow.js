@@ -1,4 +1,4 @@
-import { assertAllowedPr, parsePrUrl } from './pr.js';
+import { assertAllowedPr, gitcodePrMetadata, parsePrUrl } from './pr.js';
 import { KeyedQueue } from './keyed-queue.js';
 import { PROGRESS_HEARTBEAT_MS } from './progress.js';
 
@@ -18,26 +18,47 @@ const COMPATIBLE_BOT_SUCCESS_PATTERNS = [
   /未发现.{0,8}(?:问题|意见|评论)/i,
 ];
 export class ReviewWorkflow {
-  constructor({ config, store, feishu, agent, gitcode }) {
+  constructor({ config, store, feishu, agent, gitcode, identities }) {
     this.config = config;
     this.store = store;
     this.feishu = feishu;
     this.agent = agent;
     this.gitcode = gitcode;
+    this.identities = identities;
     this.queue = new KeyedQueue();
+    this.agentQueue = new KeyedQueue();
   }
 
   async recoverInterruptedTasks() {
-    const localReviewerIds = new Set(
-      this.config.reviewers.filter((reviewer) => reviewer.mode === 'local').map((reviewer) => reviewer.id),
-    );
-    for (const state of this.store.listPrs()) {
+    for (const request of this.store.listRunningExternalReviewRequests()) {
+      const marker = buildReviewBotProtocol({
+        action: 'result', mode: request.mode, cycle: request.cycle, status: 'failed',
+      });
+      const message = `${marker} 服务重启中断了审查任务，请重新发起：${request.prUrl || request.prKey}`;
+      await this.store.completeExternalReviewRequest(request, message);
+      await this.#sendProgress(request.chatId, message,
+        [this.#person(request.requesterOpenId, '发起机器人')]);
+    }
+    for (const savedState of this.store.listPrs()) {
+      let state = savedState;
       if (['completed', 'failed'].includes(state.phase)) continue;
-      const localReviewerWasRunning = ['awaiting_review', 'awaiting_rereview'].includes(state.phase)
-        && Object.entries(state.pending || {}).some(
-          ([reviewerId, status]) => localReviewerIds.has(reviewerId) && status === 'pending',
-        );
-      if (state.phase !== 'addressing_feedback' && !localReviewerWasRunning) continue;
+      if ((!Array.isArray(state.reviewers) || state.reviewers.length === 0)
+        && Object.keys(state.pending || {}).length > 0) {
+        const migrated = Object.keys(state.pending).map((login) => this.identities.byGitcodeLogin(login));
+        if (migrated.every(Boolean)) {
+          state = await this.store.updatePr(state.key, (current) => ({
+            ...current,
+            reviewers: migrated.map(reviewerFromIdentity),
+          }));
+        } else if (state.phase !== 'addressing_feedback') {
+          const reason = '旧状态中的 reviewer 无法映射到 IDENTITY_MAPPINGS_JSON，请重新发起该 PR 的审查';
+          await this.store.updatePr(state.key, (current) => ({ ...current, phase: 'failed', lastError: reason }));
+          await this.#sendProgress(state.chatId, `${reason}：${state.url}`,
+            state.requesterOpenId ? [this.#person(state.requesterOpenId, state.requesterName || '发起人')] : []);
+          continue;
+        }
+      }
+      if (state.phase !== 'addressing_feedback') continue;
 
       const reason = '服务重启中断了本地 agent 任务，请重新发起该 PR 的审查';
       await this.store.updatePr(state.key, (current) => ({ ...current, phase: 'failed', lastError: reason }));
@@ -56,17 +77,17 @@ export class ReviewWorkflow {
     }
 
     const protocol = parseReviewBotProtocol(event.text);
-    if (isOpenIdRequest(event.text) && !isBotSender(event, protocol)) {
-      console.log(`[setup] OWNER_OPEN_ID=${event.senderOpenId}`);
+    if (isChatIdRequest(event.text) && !isBotSender(event, protocol)) {
+      console.log(`[setup] AUTO_REVIEW_CHAT_ID=${event.chatId}`);
       await this.feishu.send(event.chatId,
-        '已将你的 OWNER_OPEN_ID 输出到本机服务日志。请复制到 .env 后重启服务。',
+        `当前会话 chat_id：${event.chatId}。请写入 AUTO_REVIEW_CHAT_ID 后重启服务。`,
         [this.#person(event.senderOpenId, '配置人')]);
       return;
     }
-    if (!this.config.feishu.ownerOpenId && !isBotSender(event, protocol)) {
-      console.log(`[setup] OWNER_OPEN_ID=${event.senderOpenId}`);
+    if (isOpenIdRequest(event.text) && !isBotSender(event, protocol)) {
+      console.log(`[setup] FEISHU_OPEN_ID=${event.senderOpenId}`);
       await this.feishu.send(event.chatId,
-        '机器人尚未绑定 PR 所有人，已将 OWNER_OPEN_ID 输出到本机服务日志。请写入 .env 后重启服务。',
+        `你的飞书 open_id 是 ${event.senderOpenId}，请填入 IDENTITY_MAPPINGS_JSON 的 feishuOpenId。`,
         [this.#person(event.senderOpenId, '配置人')]);
       return;
     }
@@ -89,93 +110,100 @@ export class ReviewWorkflow {
       return;
     }
 
-    if (event.senderOpenId === this.config.feishu.ownerOpenId) {
-      this.queue.enqueue(pr.key, () => this.#startOwnedReview(pr, event))
+    if (event.senderOpenId === this.identities.self.feishuOpenId) {
+      return this.queue.enqueue(pr.key, () => this.#startManualRequest(pr, event, protocol))
         .catch((error) => this.#reportFailure(event.chatId, pr, error));
-      return;
     }
 
     const task = owned
       ? () => this.#handleOwnedPrSignal(pr, event, protocol)
       : () => this.#reviewForExternalRequester(pr, event, protocol);
-    this.queue.enqueue(pr.key, task).catch((error) => this.#reportFailure(event.chatId, pr, error));
+    return this.queue.enqueue(pr.key, task).catch((error) => this.#reportFailure(event.chatId, pr, error));
   }
 
-  async #startOwnedReview(pr, event) {
-    if (event.chatType === 'p2p' && this.config.reviewers.some((reviewer) => reviewer.mode === 'feishu')) {
-      await this.feishu.send(event.chatId,
-        `当前 PR 配置了飞书 reviewer，无法在单聊中完成机器人互审。请在包含所有 reviewer 机器人的群聊中重新发起：${pr.url}`,
-        [this.#person(event.senderOpenId, this.config.feishu.ownerName)]);
+  async #startManualRequest(pr, event, protocol) {
+    const details = await this.gitcode.getPr(pr);
+    const metadata = gitcodePrMetadata(details);
+    if (metadata.authorLogin.toLowerCase() !== this.identities.self.gitcodeLogin.toLowerCase()) {
+      return this.#reviewForExternalRequester(pr, event, protocol);
+    }
+    const reviewers = this.#reviewersForAssignees(metadata.assigneeLogins);
+    if (reviewers.missing.length > 0 || reviewers.matched.length === 0) {
+      const reason = reviewers.missing.length
+        ? `以下 GitCode 审查人缺少三方映射：${reviewers.missing.join(', ')}`
+        : '该 PR 尚未配置其他审查人';
+      await this.feishu.send(event.chatId, `${reason}：${pr.url}`,
+        [this.#person(event.senderOpenId, this.identities.self.displayName)]);
       return;
+    }
+    return this.#startOwnedReview(pr, event, reviewers.matched, { source: 'manual', headSha: metadata.headSha });
+  }
+
+  async startAutomaticOwnedReview({ pr, reviewers, headSha }) {
+    return this.queue.enqueue(pr.key, () => this.#startOwnedReview(pr, {
+      chatId: this.config.feishu.autoReviewChatId,
+      chatType: 'group',
+      senderOpenId: this.identities.self.feishuOpenId,
+    }, reviewers, { source: 'automatic', headSha }));
+  }
+
+  async reviewAutomatically({ pr, authorIdentity, authorLogin }) {
+    return this.queue.enqueue(pr.key, () => this.#reviewAutomatically(pr, authorIdentity, authorLogin));
+  }
+
+  async #startOwnedReview(pr, event, reviewers, { source, headSha }) {
+    if (event.chatType === 'p2p') {
+      await this.feishu.send(event.chatId,
+        `PR 审查人使用飞书机器人协作，无法在单聊中完成互审。请在包含全部机器人的群聊中重新发起：${pr.url}`,
+        [this.#person(event.senderOpenId, this.identities.self.displayName)]);
+      return { started: false, reason: 'p2p' };
     }
     const existing = this.store.getPr(pr.key);
     if (existing && !['completed', 'failed'].includes(existing.phase)) {
       await this.feishu.send(event.chatId, `该 PR 已在处理中（${existing.phase}）：${pr.url}`,
-        [this.#person(event.senderOpenId, this.config.feishu.ownerName)]);
-      return;
+        [this.#person(event.senderOpenId, this.identities.self.displayName)]);
+      return { started: false, reason: 'active' };
     }
-    const pending = Object.fromEntries(this.config.reviewers.map((reviewer) => [reviewer.id, 'pending']));
+    const pending = Object.fromEntries(reviewers.map((reviewer) => [reviewer.id, 'pending']));
     const state = await this.store.putPr({
       key: pr.key,
       url: pr.url,
       chatId: event.chatId,
       requesterOpenId: event.senderOpenId,
-      requesterName: this.config.feishu.ownerName,
+      requesterName: this.identities.self.displayName,
       phase: 'awaiting_review',
       cycle: 0,
       pending,
+      reviewers,
+      source,
+      headSha,
     });
     await this.#sendProgress(event.chatId,
-      `已收到 PR 审查请求，正在启动 ${this.config.reviewers.length} 个 reviewer：${pr.url}`);
-    await this.#requestReviewers(pr, state, this.config.reviewers, 'initial');
+      `已收到 PR 审查请求，正在启动 ${reviewers.length} 个 reviewer：${pr.url}`);
+    const delivered = await this.#requestReviewers(pr, state, reviewers, 'initial');
+    if (!delivered) throw new Error('至少一个审查机器人请求发送失败');
+    return { started: true };
   }
 
   async #requestReviewers(pr, state, reviewers, mode) {
     for (const reviewer of reviewers) {
-      if (reviewer.mode === 'local') {
-        const success = await this.#runLocalReviewer(pr, reviewer, mode, state);
-        if (!success) return;
-        continue;
-      }
       const marker = buildReviewBotProtocol({ action: 'request', mode, cycle: state.cycle });
       const instruction = mode === 'rereview' ? '请复审并验证已回复的 comments' : '请审查并提交 inline comments';
       try {
         await this.feishu.send(state.chatId, `${marker} ${instruction}：${pr.url}`, [reviewer]);
       } catch (error) {
         await this.#recordReviewerOutcome(pr, reviewer.id, false, safeError(error));
-        return;
+        return false;
       }
     }
-  }
-
-  async #runLocalReviewer(pr, reviewer, mode, state) {
-    const action = mode === 'rereview' ? `第 ${state.cycle} 轮复审` : '首次审查';
-    await this.#sendProgress(state.chatId, `${reviewer.name} 已开始${action}，耗时较长时会定期报告进度：${pr.url}`);
-    try {
-      const output = await this.#runAgentWithHeartbeat({
-        chatId: state.chatId,
-        pr,
-        action: `${reviewer.name} 正在${action}`,
-        task: () => this.agent.runReview({ pr, mode, reviewerName: reviewer.name }),
-      });
-      const finding = output.result.unresolvedCount
-        ? `发现 ${output.result.unresolvedCount} 条待处理评论`
-        : '未发现待处理评论';
-      await this.#sendProgress(state.chatId,
-        `${reviewer.name} 已完成${action}（${formatDuration(output.durationMs)}），${finding}：${pr.url}`);
-      await this.#recordReviewerOutcome(pr, reviewer.id, true);
-      return true;
-    } catch (error) {
-      await this.#recordReviewerOutcome(pr, reviewer.id, false, safeError(error));
-      return false;
-    }
+    return true;
   }
 
   async #handleOwnedPrSignal(pr, event, protocol) {
     const state = this.store.getPr(pr.key);
     if (!state || ['completed', 'failed'].includes(state.phase)) return;
 
-    const reviewer = this.config.reviewers.find((item) => item.openId === event.senderOpenId);
+    const reviewer = (state.reviewers || []).find((item) => item.openId === event.senderOpenId);
     if (reviewer) {
       let success;
       if (protocol?.action === 'result') {
@@ -259,7 +287,7 @@ export class ReviewWorkflow {
       task: () => this.agent.runAddressFeedback({ pr }),
     });
 
-    const targets = reviewersForLogins(this.config.reviewers, inspection.unresolvedReviewerLogins);
+    const targets = reviewersForLogins(state.reviewers || [], inspection.unresolvedReviewerLogins);
     const pending = Object.fromEntries(targets.map((reviewer) => [reviewer.id, 'pending']));
     const next = await this.store.updatePr(pr.key, (current) => ({
       ...current,
@@ -270,7 +298,8 @@ export class ReviewWorkflow {
     const commit = addressOutput.result.commitSha ? `，commit ${addressOutput.result.commitSha.slice(0, 8)}` : '';
     await this.#sendProgress(state.chatId,
       `已按评论完成修改、测试和回复（${formatDuration(addressOutput.durationMs)}${commit}），正在请求原 reviewer 复审：${pr.url}`);
-    await this.#requestReviewers(pr, next, targets, 'rereview');
+    const delivered = await this.#requestReviewers(pr, next, targets, 'rereview');
+    if (!delivered) throw new Error('至少一个复审机器人请求发送失败');
   }
 
   async #reviewForExternalRequester(pr, event, protocol) {
@@ -282,6 +311,24 @@ export class ReviewWorkflow {
       mode,
       cycle: protocol?.cycle,
     });
+    if (protocol?.action === 'request') {
+      const claim = await this.store.claimExternalReviewRequest({
+        prKey: pr.key,
+        prUrl: pr.url,
+        chatId: event.chatId,
+        requesterOpenId: event.senderOpenId,
+        mode,
+        cycle,
+      });
+      if (!claim.claimed) {
+        console.log(`[workflow] 忽略重复审查请求 sender=${event.senderOpenId} pr=${pr.key} mode=${mode} cycle=${cycle}`);
+        if (claim.record?.resultMessage) {
+          await this.feishu.send(event.chatId, claim.record.resultMessage,
+            [this.#person(event.senderOpenId, '发起机器人')]);
+        }
+        return;
+      }
+    }
     const requesterIsBot = isBotSender(event, protocol);
     const requester = this.#person(event.senderOpenId, requesterIsBot ? '发起机器人' : '发起人');
     await this.#sendProgress(event.chatId, `已收到，正在${mode === 'rereview' ? '复审' : '审查'}，耗时较长时会定期报告进度：${pr.url}`,
@@ -302,12 +349,60 @@ export class ReviewWorkflow {
       const message = output.result.unresolvedCount
         ? `${marker} 审查完成（${formatDuration(output.durationMs)}），当前有 ${output.result.unresolvedCount} 条待处理 inline comments：${pr.url}`
         : `${marker} 审查完成（${formatDuration(output.durationMs)}），未发现待解决问题：${pr.url}`;
+      if (protocol?.action === 'request') {
+        await this.store.completeExternalReviewRequest({
+          prKey: pr.key, chatId: event.chatId, requesterOpenId: event.senderOpenId, mode, cycle,
+        }, message);
+      }
       await this.feishu.send(event.chatId, message, [requester]);
     } catch (error) {
       const marker = buildReviewBotProtocol({ action: 'result', mode, cycle, status: 'failed' });
-      await this.feishu.send(event.chatId, `${marker} 审查执行失败，请查看当前机器人日志：${safeError(error)} ${pr.url}`,
-        [requester]);
+      const message = `${marker} 审查执行失败，请查看当前机器人日志：${safeError(error)} ${pr.url}`;
+      if (protocol?.action === 'request') {
+        await this.store.completeExternalReviewRequest({
+          prKey: pr.key, chatId: event.chatId, requesterOpenId: event.senderOpenId, mode, cycle,
+        }, message);
+      }
+      await this.feishu.send(event.chatId, message, [requester]);
     }
+  }
+
+  async #reviewAutomatically(pr, authorIdentity, authorLogin) {
+    const chatId = this.config.feishu.autoReviewChatId;
+    await this.#sendProgress(chatId, `定时扫描发现分配给当前账号的 PR，正在自动审查：${pr.url}`);
+    const output = await this.#runAgentWithHeartbeat({
+      chatId,
+      pr,
+      action: '正在自动审查',
+      task: () => this.agent.runReview({
+        pr,
+        mode: 'initial',
+        reviewerName: this.config.feishu.botName,
+      }),
+    });
+    const finding = output.result.unresolvedCount
+      ? `已提交审查意见，当前有 ${output.result.unresolvedCount} 条待处理 inline comments`
+      : '审查完成，未发现待解决问题';
+    const mappingNotice = authorIdentity ? '' : `；GitCode 作者 ${authorLogin || '未知'} 未配置飞书映射`;
+    await this.feishu.send(chatId,
+      `${finding}（${formatDuration(output.durationMs)}）${mappingNotice}：${pr.url}`,
+      authorIdentity ? [this.#person(authorIdentity.feishuOpenId, authorIdentity.displayName)] : []);
+    return output;
+  }
+
+  #reviewersForAssignees(assigneeLogins) {
+    const matched = [];
+    const missing = [];
+    for (const login of assigneeLogins) {
+      if (login.toLowerCase() === this.identities.self.gitcodeLogin.toLowerCase()) continue;
+      const identity = this.identities.byGitcodeLogin(login);
+      if (!identity) {
+        missing.push(login);
+        continue;
+      }
+      matched.push(reviewerFromIdentity(identity));
+    }
+    return { matched, missing };
   }
 
   #person(openId, name) {
@@ -315,6 +410,10 @@ export class ReviewWorkflow {
   }
 
   async #runAgentWithHeartbeat({ chatId, pr, action, task }) {
+    return this.agentQueue.enqueue('agent', () => this.#runAgentTaskWithHeartbeat({ chatId, pr, action, task }));
+  }
+
+  async #runAgentTaskWithHeartbeat({ chatId, pr, action, task }) {
     const startedAt = Date.now();
     const heartbeat = setInterval(() => {
       const elapsed = formatDuration(Date.now() - startedAt);
@@ -384,6 +483,10 @@ function isOpenIdRequest(text = '') {
   return /获取(?:我的)?\s*open[_ -]?id/i.test(String(text));
 }
 
+function isChatIdRequest(text = '') {
+  return /获取(?:当前)?\s*chat[_ -]?id/i.test(String(text));
+}
+
 function isReviewRequest(text, protocol) {
   if (protocol) return protocol.action === 'request';
   const value = String(text);
@@ -405,6 +508,15 @@ function reviewersForLogins(reviewers, reviewerLogins) {
   const logins = new Set(reviewerLogins.map((item) => item.toLowerCase()).filter(Boolean));
   const matched = reviewers.filter((reviewer) => reviewer.gitcodeLogin && logins.has(reviewer.gitcodeLogin.toLowerCase()));
   return matched.length > 0 ? matched : reviewers;
+}
+
+export function reviewerFromIdentity(identity) {
+  return {
+    id: identity.gitcodeLogin.toLowerCase(),
+    name: `${identity.displayName} bot`,
+    openId: identity.botOpenId,
+    gitcodeLogin: identity.gitcodeLogin,
+  };
 }
 
 function safeError(error) {

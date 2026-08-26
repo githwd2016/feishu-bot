@@ -21,3 +21,51 @@ export function assertAllowedPr(pr, allowedRepos) {
   }
   return pr;
 }
+
+export function prFromGitCodeData(data) {
+  const direct = parsePrUrl(data?.html_url ?? data?.htmlUrl ?? '');
+  if (direct) return direct;
+
+  const apiMatch = String(data?.url || '').match(/\/repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)/i);
+  if (apiMatch) {
+    return makePr(apiMatch[1], apiMatch[2], Number(apiMatch[3]));
+  }
+
+  const number = Number(data?.number ?? data?.iid);
+  const repo = data?.base?.repo ?? data?.head?.repo ?? data?.repository;
+  const owner = repo?.name_space?.path
+    ?? repo?.namespace?.path
+    ?? repo?.owner?.login
+    ?? repo?.owner?.path;
+  const repoPath = repo?.path ?? repo?.name;
+  if (owner && repoPath && Number.isInteger(number) && number > 0) {
+    return makePr(owner, repoPath, number);
+  }
+  return null;
+}
+
+export function gitcodePrMetadata(data) {
+  const authorLogin = firstString(
+    data?.user?.login,
+    data?.author?.login,
+    data?.author?.username,
+    data?.creator?.login,
+  );
+  const headSha = firstString(data?.head?.sha, data?.head_sha, data?.sha);
+  const assigneeLogins = [...new Set(
+    (Array.isArray(data?.assignees) ? data.assignees : [])
+      .map((item) => firstString(item?.login, item?.username))
+      .filter(Boolean)
+      .map((item) => item.toLowerCase()),
+  )];
+  return { authorLogin, headSha, assigneeLogins };
+}
+
+function makePr(owner, repo, number) {
+  return parsePrUrl(`https://gitcode.com/${owner}/${repo}/pull/${number}`);
+}
+
+function firstString(...values) {
+  const value = values.find((item) => typeof item === 'string' && item.trim());
+  return value ? value.trim() : '';
+}
