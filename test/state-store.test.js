@@ -19,6 +19,19 @@ test('StateStore persists PR state and de-duplicates messages', async (t) => {
   assert.equal(await store.claimExternalReviewCycle({
     prKey: 'a/b#1', chatId: 'c1', requesterOpenId: 'user', mode: 'rereview',
   }), 1);
+  assert.equal((await store.claimExternalReviewRequest({
+    prKey: 'a/b#1', chatId: 'c1', requesterOpenId: 'bot', mode: 'initial', cycle: 0,
+  })).claimed, true);
+  assert.equal((await store.claimExternalReviewRequest({
+    prKey: 'a/b#1', chatId: 'c1', requesterOpenId: 'bot', mode: 'initial', cycle: 0,
+  })).claimed, false);
+  const lease = await store.claimAutomationTask('review|a/b#1|sha', {
+    maxAttempts: 3, staleAfterMs: 60_000,
+  });
+  assert.equal(lease.status, 'running');
+  assert.equal(lease.attempts, 1);
+  assert.match(lease.updatedAt, /^\d{4}-/);
+  await store.completeAutomationTask('review|a/b#1|sha');
   await store.putPr({ key: 'a/b#1', url: 'https://gitcode.com/a/b/pull/1', chatId: 'c1', phase: 'awaiting_review' });
 
   const reloaded = new StateStore(file);
@@ -29,4 +42,8 @@ test('StateStore persists PR state and de-duplicates messages', async (t) => {
   assert.equal(await reloaded.claimExternalReviewCycle({
     prKey: 'a/b#1', chatId: 'c1', requesterOpenId: 'user', mode: 'rereview',
   }), 2);
+  assert.equal(reloaded.getAutomationTask('review|a/b#1|sha').status, 'succeeded');
+  assert.equal(await reloaded.claimAutomationTask('review|a/b#1|sha', {
+    maxAttempts: 3, staleAfterMs: 0,
+  }), null);
 });

@@ -1,11 +1,12 @@
 import 'dotenv/config';
 import { installTimestampedConsole } from './logger.js';
-import { loadConfig } from './config.js';
+import { loadConfig, resolveRuntimeIdentities } from './config.js';
 import { StateStore } from './state-store.js';
 import { FeishuGateway } from './feishu.js';
 import { AgentRunner } from './agent-runner.js';
 import { GitCodeClient } from './gitcode-client.js';
 import { ReviewWorkflow } from './workflow.js';
+import { PrScanner } from './pr-scanner.js';
 
 installTimestampedConsole();
 
@@ -16,16 +17,20 @@ async function main() {
   const feishu = new FeishuGateway(config.feishu);
   const agent = new AgentRunner(config);
   const gitcode = new GitCodeClient(config.gitcode);
-  const workflow = new ReviewWorkflow({ config, store, feishu, agent, gitcode });
+  const [botIdentity, gitcodeUser] = await Promise.all([
+    feishu.getBotIdentity(),
+    gitcode.getCurrentUser(),
+  ]);
+  console.log(`[setup] BOT_OPEN_ID=${botIdentity.openId} BOT_NAME=${botIdentity.name}`);
+  console.log(`[setup] GITCODE_LOGIN=${gitcodeUser.login}`);
+  const identities = resolveRuntimeIdentities(config.identityMappings, { botIdentity, gitcodeUser });
+  console.log(`[setup] IDENTITY_MATCH FEISHU_OPEN_ID=${identities.self.feishuOpenId}`);
+  const workflow = new ReviewWorkflow({ config, store, feishu, agent, gitcode, identities });
+  const scanner = new PrScanner({ config, store, feishu, gitcode, workflow, identities });
 
-  try {
-    const identity = await feishu.getBotIdentity();
-    console.log(`[setup] BOT_OPEN_ID=${identity.openId} BOT_NAME=${identity.name}`);
-  } catch (error) {
-    console.warn('[setup] 暂时无法获取 BOT_OPEN_ID，机器人仍将继续启动:', error.message);
-  }
   await workflow.recoverInterruptedTasks();
   feishu.start((event) => workflow.onFeishuMessage(event));
+  scanner.start();
   console.log(`[main] ${config.feishu.botName} 已启动`);
 }
 

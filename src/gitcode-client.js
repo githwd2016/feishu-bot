@@ -8,6 +8,32 @@ export class GitCodeClient {
     return this.request(`/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}/pulls/${pr.number}`);
   }
 
+  async getCurrentUser() {
+    return this.request('/user');
+  }
+
+  async listUserPulls({ scope, state = 'open' }) {
+    if (!['need_my_approve', 'created_by_me'].includes(scope)) {
+      throw new Error(`不支持的 GitCode PR scope: ${scope}`);
+    }
+    const all = [];
+    for (let page = 1; page <= 100; page += 1) {
+      const params = new URLSearchParams({
+        scope,
+        state,
+        sort: 'updated',
+        direction: 'desc',
+        page: String(page),
+        per_page: '100',
+      });
+      const batch = await this.request(`/user/pulls?${params}`);
+      if (!Array.isArray(batch)) throw new Error('GitCode 用户 PR 列表接口返回了非数组数据');
+      all.push(...batch);
+      if (batch.length < 100) break;
+    }
+    return all;
+  }
+
   async listFiles(pr) {
     return this.request(`/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}/pulls/${pr.number}/files`);
   }
