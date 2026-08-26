@@ -380,13 +380,17 @@ export class ReviewWorkflow {
         reviewerName: this.config.feishu.botName,
       }),
     });
-    const finding = output.result.unresolvedCount
+    const hasFindings = output.result.unresolvedCount > 0;
+    const finding = hasFindings
       ? `已提交审查意见，当前有 ${output.result.unresolvedCount} 条待处理 inline comments`
       : '审查完成，未发现待解决问题';
-    const mappingNotice = authorIdentity ? '' : `；GitCode 作者 ${authorLogin || '未知'} 未配置飞书映射`;
+    const mappingNotice = hasFindings && !authorIdentity
+      ? `；GitCode 作者 ${authorLogin || '未知'} 未配置飞书映射`
+      : '';
+    const recipient = hasFindings ? authorIdentity : this.identities.self;
     await this.feishu.send(chatId,
       `${finding}（${formatDuration(output.durationMs)}）${mappingNotice}：${pr.url}`,
-      authorIdentity ? [this.#person(authorIdentity.feishuOpenId, authorIdentity.displayName)] : []);
+      recipient ? [this.#person(recipient.feishuOpenId, recipient.displayName)] : []);
     return output;
   }
 

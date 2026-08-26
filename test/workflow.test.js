@@ -78,7 +78,7 @@ test('bot protocol requests are persisted and de-duplicated by PR, sender, mode,
   assert.ok(context.sent.some((item) => /action=result mode=initial cycle=4 status=success/.test(String(item[1]))));
 });
 
-test('automatic assigned review runs the agent and mentions the mapped PR author', async (t) => {
+test('automatic assigned review with findings mentions the mapped PR author', async (t) => {
   const context = await makeContext(t);
   const workflow = makeWorkflow(context, {
     agent: {
@@ -95,6 +95,25 @@ test('automatic assigned review runs the agent and mentions the mapped PR author
   const final = context.sent.at(-1);
   assert.match(final[1], /2 条待处理/);
   assert.equal(final[2][0].openId, LISI.feishuOpenId);
+});
+
+test('automatic assigned review without findings mentions the current reviewer', async (t) => {
+  const context = await makeContext(t);
+  const workflow = makeWorkflow(context, {
+    agent: {
+      runReview: async () => ({ durationMs: 65_000, result: { unresolvedCount: 0 } }),
+    },
+  });
+
+  await workflow.reviewAutomatically({
+    pr: { owner: 'org', repo: 'repo', repoKey: 'org/repo', key: 'org/repo#8', url: 'https://gitcode.com/org/repo/pull/8', number: 8 },
+    authorIdentity: LISI,
+    authorLogin: 'lisi',
+  });
+
+  const final = context.sent.at(-1);
+  assert.match(final[1], /未发现待解决问题/);
+  assert.equal(final[2][0].openId, SELF.feishuOpenId);
 });
 
 test('setup commands report the current chat ID and sender Feishu open ID', async (t) => {
