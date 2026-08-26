@@ -1,4 +1,9 @@
-import { assertAllowedPr, gitcodePrMetadata, prFromGitCodeData } from './pr.js';
+import {
+  assertAllowedPr,
+  gitcodePrMetadata,
+  isGitCodePrWip,
+  prFromGitCodeData,
+} from './pr.js';
 import { reviewerFromIdentity } from './workflow.js';
 
 const ACTIVE_PHASES = new Set(['awaiting_review', 'addressing_feedback', 'awaiting_rereview']);
@@ -140,7 +145,15 @@ export class PrScanner {
     if (!pr) throw new Error('GitCode PR 列表项缺少可识别的仓库或 PR 编号');
     if (this.config.gitcode.allowedRepos.size > 0 && !this.config.gitcode.allowedRepos.has(pr.repoKey)) return null;
     assertAllowedPr(pr, this.config.gitcode.allowedRepos);
+    if (isGitCodePrWip(item)) {
+      console.log(`[scanner] 跳过 WIP PR: ${pr.url}`);
+      return null;
+    }
     const details = await this.gitcode.getPr(pr);
+    if (isGitCodePrWip(details)) {
+      console.log(`[scanner] 跳过 WIP PR: ${pr.url}`);
+      return null;
+    }
     return { pr, details, metadata: gitcodePrMetadata(details) };
   }
 

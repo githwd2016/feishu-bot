@@ -61,6 +61,12 @@ export function gitcodePrMetadata(data) {
   return { authorLogin, headSha, assigneeLogins };
 }
 
+export function isGitCodePrWip(data) {
+  return isEnabledFlag(data?.draft)
+    || isEnabledFlag(data?.work_in_progress)
+    || /^\s*\[WIP\](?:\s|$)/i.test(String(data?.title || ''));
+}
+
 function makePr(owner, repo, number) {
   return parsePrUrl(`https://gitcode.com/${owner}/${repo}/pull/${number}`);
 }
@@ -68,4 +74,9 @@ function makePr(owner, repo, number) {
 function firstString(...values) {
   const value = values.find((item) => typeof item === 'string' && item.trim());
   return value ? value.trim() : '';
+}
+
+function isEnabledFlag(value) {
+  if (value === true || value === 1) return true;
+  return typeof value === 'string' && ['true', '1'].includes(value.trim().toLowerCase());
 }

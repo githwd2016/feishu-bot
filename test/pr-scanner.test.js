@@ -72,6 +72,36 @@ test('scanner refuses partial owned-PR dispatch when an assignee mapping is miss
   assert.equal(context.sent[0][2][0].openId, SELF.feishuOpenId);
 });
 
+test('scanner skips WIP PRs in both automatic scopes', async (t) => {
+  const context = await makeContext(t);
+  const automaticReviews = [];
+  const ownedDispatches = [];
+  const loadedPrNumbers = [];
+  const scanner = makeScanner(context, {
+    gitcode: {
+      listUserPulls: async ({ scope }) => scope === 'need_my_approve'
+        ? [{ html_url: 'https://gitcode.com/org/repo/pull/1', draft: true }]
+        : [{ html_url: 'https://gitcode.com/org/repo/pull/2' }],
+      getPr: async (pr) => {
+        loadedPrNumbers.push(pr.number);
+        return { ...details('zhangsan', 'owned-a', ['lisi']), work_in_progress: true };
+      },
+    },
+    workflow: {
+      reviewAutomatically: async (input) => automaticReviews.push(input),
+      startAutomaticOwnedReview: async (input) => {
+        ownedDispatches.push(input);
+        return { started: true };
+      },
+    },
+  });
+
+  assert.equal(await scanner.scanOnce(), true);
+  assert.deepEqual(loadedPrNumbers, [2], 'list-level WIP flags skip the details request');
+  assert.equal(automaticReviews.length, 0);
+  assert.equal(ownedDispatches.length, 0);
+});
+
 test('scanner retries failed automatic reviews three times and then alerts the responsible user', async (t) => {
   const context = await makeContext(t);
   let attempts = 0;
