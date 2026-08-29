@@ -60,6 +60,7 @@ test('bot protocol requests are persisted and de-duplicated by PR, sender, mode,
   const context = await makeContext(t);
   let reviewCalls = 0;
   const workflow = makeWorkflow(context, {
+    gitcode: { getPr: async () => prDetails({ author: 'lisi', assignees: [], sha: 'protocol-sha' }) },
     agent: {
       runReview: async () => {
         reviewCalls += 1;
@@ -76,6 +77,114 @@ test('bot protocol requests are persisted and de-duplicated by PR, sender, mode,
 
   assert.equal(reviewCalls, 1);
   assert.ok(context.sent.some((item) => /action=result mode=initial cycle=4 status=success/.test(String(item[1]))));
+});
+
+test('different message IDs for the same plain request are coalesced before the PR queue', async (t) => {
+  const context = await makeContext(t);
+  let reviewCalls = 0;
+  let releaseReview;
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const gate = new Promise((resolve) => { releaseReview = resolve; });
+  const workflow = makeWorkflow(context, {
+    gitcode: { getPr: async () => prDetails({ author: 'lisi', assignees: [], sha: 'same-sha' }) },
+    agent: {
+      runReview: async () => {
+        reviewCalls += 1;
+        markStarted();
+        await gate;
+        return { durationMs: 1000, result: { unresolvedCount: 0 } };
+      },
+    },
+  });
+  const request = (messageId) => message({
+    messageId, senderOpenId: LISI.botOpenId, senderType: 'app',
+    text: '请审查：https://gitcode.com/org/repo/pull/9',
+  });
+
+  const first = workflow.onFeishuMessage(request('plain-one'));
+  await started;
+  await workflow.onFeishuMessage(request('plain-two'));
+
+  assert.equal(reviewCalls, 1);
+  assert.ok(context.sent.some((item) => String(item[1]).includes('已在审查处理中（cycle 0）')));
+  releaseReview();
+  await first;
+  assert.equal(reviewCalls, 1);
+});
+
+test('plain initial requests replay completed results until the head SHA changes', async (t) => {
+  const context = await makeContext(t);
+  let headSha = 'sha-1';
+  let reviewCalls = 0;
+  const workflow = makeWorkflow(context, {
+    gitcode: { getPr: async () => prDetails({ author: 'lisi', assignees: [], sha: headSha }) },
+    agent: {
+      runReview: async () => {
+        reviewCalls += 1;
+        return { durationMs: 1000, result: { unresolvedCount: 0 } };
+      },
+    },
+  });
+  const request = (messageId) => message({
+    messageId, senderOpenId: LISI.botOpenId, senderType: 'app',
+    text: '请审查：https://gitcode.com/org/repo/pull/9',
+  });
+
+  await workflow.onFeishuMessage(request('initial-one'));
+  await workflow.onFeishuMessage(request('initial-duplicate'));
+  assert.equal(reviewCalls, 1);
+  assert.equal(context.sent.filter((item) => /action=result mode=initial cycle=0 status=success/.test(String(item[1]))).length, 2);
+
+  headSha = 'sha-2';
+  await workflow.onFeishuMessage(request('initial-new-head'));
+  assert.equal(reviewCalls, 2);
+});
+
+test('plain rereview cycles advance only when mode or head SHA changes', async (t) => {
+  const context = await makeContext(t);
+  let headSha = 'sha-1';
+  let reviewCalls = 0;
+  const workflow = makeWorkflow(context, {
+    gitcode: { getPr: async () => prDetails({ author: 'lisi', assignees: [], sha: headSha }) },
+    agent: {
+      runReview: async () => {
+        reviewCalls += 1;
+        return { durationMs: 1000, result: { unresolvedCount: 0 } };
+      },
+    },
+  });
+  const request = (messageId, text) => message({
+    messageId, senderOpenId: LISI.botOpenId, senderType: 'app', text,
+  });
+
+  await workflow.onFeishuMessage(request('cycle-initial', '请审查：https://gitcode.com/org/repo/pull/9'));
+  await workflow.onFeishuMessage(request('cycle-rereview', '评论均已解决，请复审：https://gitcode.com/org/repo/pull/9'));
+  await workflow.onFeishuMessage(request('cycle-rereview-duplicate', '评论均已解决，请复审：https://gitcode.com/org/repo/pull/9'));
+  assert.equal(reviewCalls, 2);
+  assert.equal(context.sent.filter((item) => /action=result mode=rereview cycle=1 status=success/.test(String(item[1]))).length, 2);
+
+  headSha = 'sha-2';
+  await workflow.onFeishuMessage(request('cycle-rereview-new-head', '评论均已解决，请复审：https://gitcode.com/org/repo/pull/9'));
+  assert.equal(reviewCalls, 3);
+  assert.ok(context.sent.some((item) => /action=result mode=rereview cycle=2 status=success/.test(String(item[1]))));
+});
+
+test('external reviews fail before enqueueing when GitCode omits the head SHA', async (t) => {
+  const context = await makeContext(t);
+  let reviewCalls = 0;
+  const workflow = makeWorkflow(context, {
+    gitcode: { getPr: async () => prDetails({ author: 'lisi', assignees: [], sha: '' }) },
+    agent: { runReview: async () => { reviewCalls += 1; } },
+  });
+
+  await workflow.onFeishuMessage(message({
+    messageId: 'missing-head', senderOpenId: LISI.botOpenId, senderType: 'app',
+    text: '请审查：https://gitcode.com/org/repo/pull/9',
+  }));
+
+  assert.equal(reviewCalls, 0);
+  assert.ok(context.sent.some((item) => /未返回 head SHA/.test(String(item[1]))));
 });
 
 test('automatic assigned review with findings mentions the mapped PR author', async (t) => {
@@ -161,7 +270,7 @@ test('startup recovery turns an interrupted external bot review into a retryable
   const context = await makeContext(t);
   await context.store.claimExternalReviewRequest({
     prKey: 'org/repo#13', prUrl: 'https://gitcode.com/org/repo/pull/13', chatId: 'chat',
-    requesterOpenId: LISI.botOpenId, mode: 'initial', cycle: 2,
+    requesterOpenId: LISI.botOpenId, mode: 'initial', cycle: 2, headSha: 'interrupted-sha',
   });
   const workflow = makeWorkflow(context);
 
