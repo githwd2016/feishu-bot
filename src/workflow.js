@@ -115,17 +115,28 @@ export class ReviewWorkflow {
         .catch((error) => this.#reportFailure(event.chatId, pr, error));
     }
 
-    const task = owned
-      ? () => this.#handleOwnedPrSignal(pr, event, protocol)
-      : () => this.#reviewForExternalRequester(pr, event, protocol);
-    return this.queue.enqueue(pr.key, task).catch((error) => this.#reportFailure(event.chatId, pr, error));
+    if (owned) {
+      return this.queue.enqueue(pr.key, () => this.#handleOwnedPrSignal(pr, event, protocol))
+        .catch((error) => this.#reportFailure(event.chatId, pr, error));
+    }
+
+    try {
+      const request = await this.#claimExternalReview(pr, event, protocol);
+      if (!request) return;
+      return this.queue.enqueue(pr.key, () => this.#reviewForExternalRequester(pr, event, protocol, request))
+        .catch((error) => this.#reportFailure(event.chatId, pr, error));
+    } catch (error) {
+      return this.#reportFailure(event.chatId, pr, error);
+    }
   }
 
   async #startManualRequest(pr, event, protocol) {
     const details = await this.gitcode.getPr(pr);
     const metadata = gitcodePrMetadata(details);
     if (metadata.authorLogin.toLowerCase() !== this.identities.self.gitcodeLogin.toLowerCase()) {
-      return this.#reviewForExternalRequester(pr, event, protocol);
+      const request = await this.#claimExternalReview(pr, event, protocol, metadata);
+      if (!request) return;
+      return this.#reviewForExternalRequester(pr, event, protocol, request);
     }
     const reviewers = this.#reviewersForAssignees(metadata.assigneeLogins);
     if (reviewers.missing.length > 0 || reviewers.matched.length === 0) {
@@ -302,33 +313,39 @@ export class ReviewWorkflow {
     if (!delivered) throw new Error('至少一个复审机器人请求发送失败');
   }
 
-  async #reviewForExternalRequester(pr, event, protocol) {
+  async #claimExternalReview(pr, event, protocol, loadedMetadata) {
     const mode = protocol?.action === 'request' ? protocol.mode : inferReviewMode(event.text);
-    const cycle = await this.store.claimExternalReviewCycle({
+    const metadata = loadedMetadata || gitcodePrMetadata(await this.gitcode.getPr(pr));
+    if (!metadata.headSha) throw new Error(`GitCode PR 未返回 head SHA: ${pr.url}`);
+    const claim = await this.store.claimExternalReviewRequest({
       prKey: pr.key,
+      prUrl: pr.url,
       chatId: event.chatId,
       requesterOpenId: event.senderOpenId,
       mode,
       cycle: protocol?.cycle,
+      headSha: metadata.headSha,
     });
-    if (protocol?.action === 'request') {
-      const claim = await this.store.claimExternalReviewRequest({
-        prKey: pr.key,
-        prUrl: pr.url,
-        chatId: event.chatId,
-        requesterOpenId: event.senderOpenId,
-        mode,
-        cycle,
-      });
-      if (!claim.claimed) {
-        console.log(`[workflow] 忽略重复审查请求 sender=${event.senderOpenId} pr=${pr.key} mode=${mode} cycle=${cycle}`);
-        if (claim.record?.resultMessage) {
-          await this.feishu.send(event.chatId, claim.record.resultMessage,
-            [this.#person(event.senderOpenId, '发起机器人')]);
-        }
-        return;
-      }
+    const decision = claim.claimed ? 'claimed' : claim.record.status;
+    console.log(`[workflow] external-review message=${event.messageId} sender=${event.senderOpenId} pr=${pr.key} mode=${mode} cycle=${claim.record.cycle} head=${metadata.headSha} decision=${decision}`);
+    if (claim.claimed) return claim.record;
+
+    const requesterIsBot = isBotSender(event, protocol);
+    const requester = this.#person(event.senderOpenId, requesterIsBot ? '发起机器人' : '发起人');
+    if (claim.record.status === 'running') {
+      await this.#sendProgress(event.chatId,
+        `该 PR 已在${mode === 'rereview' ? '复审' : '审查'}处理中（cycle ${claim.record.cycle}）：${pr.url}`,
+        requesterIsBot ? [] : [requester]);
+    } else if (claim.record.resultMessage) {
+      await this.feishu.send(event.chatId, claim.record.resultMessage, [requester]);
+    } else {
+      await this.#sendProgress(event.chatId, `该 PR 本轮审查已完成：${pr.url}`, [requester]);
     }
+    return null;
+  }
+
+  async #reviewForExternalRequester(pr, event, protocol, request) {
+    const { mode, cycle } = request;
     const requesterIsBot = isBotSender(event, protocol);
     const requester = this.#person(event.senderOpenId, requesterIsBot ? '发起机器人' : '发起人');
     await this.#sendProgress(event.chatId, `已收到，正在${mode === 'rereview' ? '复审' : '审查'}，耗时较长时会定期报告进度：${pr.url}`,
@@ -349,20 +366,12 @@ export class ReviewWorkflow {
       const message = output.result.unresolvedCount
         ? `${marker} 审查完成（${formatDuration(output.durationMs)}），当前有 ${output.result.unresolvedCount} 条待处理 inline comments：${pr.url}`
         : `${marker} 审查完成（${formatDuration(output.durationMs)}），未发现待解决问题：${pr.url}`;
-      if (protocol?.action === 'request') {
-        await this.store.completeExternalReviewRequest({
-          prKey: pr.key, chatId: event.chatId, requesterOpenId: event.senderOpenId, mode, cycle,
-        }, message);
-      }
+      await this.store.completeExternalReviewRequest(request, message);
       await this.feishu.send(event.chatId, message, [requester]);
     } catch (error) {
       const marker = buildReviewBotProtocol({ action: 'result', mode, cycle, status: 'failed' });
       const message = `${marker} 审查执行失败，请查看当前机器人日志：${safeError(error)} ${pr.url}`;
-      if (protocol?.action === 'request') {
-        await this.store.completeExternalReviewRequest({
-          prKey: pr.key, chatId: event.chatId, requesterOpenId: event.senderOpenId, mode, cycle,
-        }, message);
-      }
+      await this.store.completeExternalReviewRequest(request, message);
       await this.feishu.send(event.chatId, message, [requester]);
     }
   }
