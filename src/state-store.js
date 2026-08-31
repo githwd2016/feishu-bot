@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 const EMPTY = {
-  version: 4,
+  version: 5,
   prs: {},
   externalReviewCycles: {},
   externalReviewRequests: {},
@@ -61,24 +61,21 @@ export class StateStore {
     });
   }
 
-  async claimExternalReviewCycle({ prKey, chatId, requesterOpenId, mode, cycle }) {
+  async claimExternalReviewRequest({ prKey, prUrl, chatId, requesterOpenId, mode, cycle, headSha }) {
     return this.#mutate((state) => {
-      const key = JSON.stringify([prKey, chatId, requesterOpenId]);
-      const current = state.externalReviewCycles[key];
-      const next = Number.isInteger(cycle)
+      if (!headSha) throw new Error(`外部审查请求缺少 head SHA: ${prUrl || prKey}`);
+      const trackerKey = JSON.stringify([prKey, chatId, requesterOpenId]);
+      const tracker = normalizeExternalReviewTracker(state.externalReviewCycles[trackerKey]);
+      const resolvedCycle = Number.isInteger(cycle)
         ? cycle
-        : mode === 'rereview'
-          ? Math.max(1, (Number.isInteger(current) ? current : 0) + 1)
-          : 0;
-      state.externalReviewCycles[key] = next;
-      return next;
-    });
-  }
-
-  async claimExternalReviewRequest({ prKey, prUrl, chatId, requesterOpenId, mode, cycle }) {
-    return this.#mutate((state) => {
-      const key = JSON.stringify([prKey, requesterOpenId, mode, cycle]);
+        : tracker?.headSha === headSha && tracker?.mode === mode
+          ? tracker.cycle
+          : mode === 'rereview'
+            ? Math.max(1, (tracker?.cycle || 0) + 1)
+            : 0;
+      const key = JSON.stringify([prKey, requesterOpenId, mode, resolvedCycle, headSha]);
       const current = state.externalReviewRequests[key];
+      state.externalReviewCycles[trackerKey] = { cycle: resolvedCycle, mode, headSha };
       const retryableFailure = current?.status === 'failed'
         || (current?.status === 'completed' && FAILED_REVIEW_RESULT_PATTERN.test(current.resultMessage || ''));
       if (current && !retryableFailure) return { claimed: false, record: structuredClone(current) };
@@ -89,7 +86,8 @@ export class StateStore {
         chatId,
         requesterOpenId,
         mode,
-        cycle,
+        cycle: resolvedCycle,
+        headSha,
         status: 'running',
         attempts: (current?.attempts || 0) + 1,
         resultMessage: '',
@@ -108,11 +106,15 @@ export class StateStore {
       .map((item) => structuredClone(item));
   }
 
-  async completeExternalReviewRequest(
-    { prKey, chatId, requesterOpenId, mode, cycle }, resultMessage, { success = true } = {},
-  ) {
+  async completeExternalReviewRequest(request, resultMessage, { success = true } = {}) {
     return this.#mutate((state) => {
-      const key = JSON.stringify([prKey, requesterOpenId, mode, cycle]);
+      const key = request?.key || JSON.stringify([
+        request?.prKey,
+        request?.requesterOpenId,
+        request?.mode,
+        request?.cycle,
+        request?.headSha,
+      ]);
       const current = state.externalReviewRequests[key];
       if (!current || typeof current !== 'object') throw new Error(`外部审查请求状态不存在: ${key}`);
       const next = {
@@ -217,4 +219,14 @@ export class StateStore {
     await this.#lock;
     return result;
   }
+}
+
+function normalizeExternalReviewTracker(value) {
+  if (Number.isInteger(value)) return { cycle: value, mode: '', headSha: '' };
+  if (!value || typeof value !== 'object' || !Number.isInteger(value.cycle)) return null;
+  return {
+    cycle: value.cycle,
+    mode: String(value.mode || ''),
+    headSha: String(value.headSha || ''),
+  };
 }
