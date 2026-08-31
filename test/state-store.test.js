@@ -60,6 +60,75 @@ test('StateStore persists PR state and de-duplicates messages', async (t) => {
   }), null);
 });
 
+test('failed external review requests are retryable while successful results stay de-duplicated', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'review-state-retry-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new StateStore(path.join(directory, 'state.json'));
+  await store.load();
+  const request = {
+    prKey: 'a/b#2', prUrl: 'https://gitcode.com/a/b/pull/2', chatId: 'c1',
+    requesterOpenId: 'bot', mode: 'initial', cycle: 0, headSha: 'sha-retry',
+  };
+
+  const first = await store.claimExternalReviewRequest(request);
+  assert.equal(first.claimed, true);
+  assert.equal(first.record.attempts, 1);
+  await store.completeExternalReviewRequest(
+    first.record,
+    '[review-bot action=result mode=initial cycle=0 status=failed] failed',
+    { success: false },
+  );
+
+  const retry = await store.claimExternalReviewRequest(request);
+  assert.equal(retry.claimed, true);
+  assert.equal(retry.record.attempts, 2);
+  await store.completeExternalReviewRequest(
+    retry.record,
+    '[review-bot action=result mode=initial cycle=0 status=success] done',
+  );
+
+  const duplicate = await store.claimExternalReviewRequest(request);
+  assert.equal(duplicate.claimed, false);
+  assert.equal(duplicate.record.status, 'completed');
+  assert.equal(duplicate.record.attempts, 2);
+});
+
+test('legacy completed failure records are recognized as retryable', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'review-state-legacy-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'state.json');
+  const trackerKey = JSON.stringify(['a/b#3', 'c1', 'bot']);
+  const key = JSON.stringify(['a/b#3', 'bot', 'initial', 0, 'sha-legacy']);
+  await fs.writeFile(file, JSON.stringify({
+    version: 5,
+    prs: {},
+    externalReviewCycles: {
+      [trackerKey]: { cycle: 0, mode: 'initial', headSha: 'sha-legacy' },
+    },
+    externalReviewRequests: {
+      [key]: {
+        key, prKey: 'a/b#3', prUrl: 'https://gitcode.com/a/b/pull/3', chatId: 'c1',
+        requesterOpenId: 'bot', mode: 'initial', cycle: 0, status: 'completed',
+        headSha: 'sha-legacy', attempts: 1,
+        resultMessage: '[review-bot action=result mode=initial cycle=0 status=failed] old failure',
+      },
+    },
+    automationTasks: {},
+    seenMessageIds: [],
+  }));
+  const store = new StateStore(file);
+  await store.load();
+
+  const retry = await store.claimExternalReviewRequest({
+    prKey: 'a/b#3', prUrl: 'https://gitcode.com/a/b/pull/3', chatId: 'c1',
+    requesterOpenId: 'bot', mode: 'initial', cycle: 0, headSha: 'sha-legacy',
+  });
+
+  assert.equal(retry.claimed, true);
+  assert.equal(retry.record.status, 'running');
+  assert.equal(retry.record.attempts, 2);
+});
+
 test('StateStore migrates version 4 cycle counters and preserves running external reviews', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'review-bot-v4-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));

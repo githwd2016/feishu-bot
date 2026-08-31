@@ -79,6 +79,33 @@ test('bot protocol requests are persisted and de-duplicated by PR, sender, mode,
   assert.ok(context.sent.some((item) => /action=result mode=initial cycle=4 status=success/.test(String(item[1]))));
 });
 
+test('a failed bot protocol request can retry the same PR, mode, and cycle', async (t) => {
+  const context = await makeContext(t);
+  let reviewCalls = 0;
+  const workflow = makeWorkflow(context, {
+    gitcode: { getPr: async () => prDetails({ author: 'lisi', assignees: [], sha: 'retry-sha' }) },
+    agent: {
+      runReview: async () => {
+        reviewCalls += 1;
+        if (reviewCalls === 1) throw new Error('temporary review failure');
+        return { durationMs: 1000, result: { unresolvedCount: 0 } };
+      },
+    },
+  });
+  const text = `${buildReviewBotProtocol({ action: 'request', mode: 'initial', cycle: 4 })} https://gitcode.com/org/repo/pull/9`;
+
+  await workflow.onFeishuMessage(message({
+    messageId: 'failed-request', senderOpenId: LISI.botOpenId, senderType: 'app', text,
+  }));
+  await waitFor(() => context.sent.some((item) => /status=failed/.test(String(item[1]))));
+  await workflow.onFeishuMessage(message({
+    messageId: 'retry-request', senderOpenId: LISI.botOpenId, senderType: 'app', text,
+  }));
+  await waitFor(() => context.sent.some((item) => /status=success/.test(String(item[1]))));
+
+  assert.equal(reviewCalls, 2);
+});
+
 test('different message IDs for the same plain request are coalesced before the PR queue', async (t) => {
   const context = await makeContext(t);
   let reviewCalls = 0;
@@ -186,7 +213,6 @@ test('external reviews fail before enqueueing when GitCode omits the head SHA', 
   assert.equal(reviewCalls, 0);
   assert.ok(context.sent.some((item) => /未返回 head SHA/.test(String(item[1]))));
 });
-
 test('automatic assigned review with findings mentions the mapped PR author', async (t) => {
   const context = await makeContext(t);
   const workflow = makeWorkflow(context, {

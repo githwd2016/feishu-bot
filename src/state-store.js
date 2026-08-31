@@ -9,6 +9,7 @@ const EMPTY = {
   automationTasks: {},
   seenMessageIds: [],
 };
+const FAILED_REVIEW_RESULT_PATTERN = /\[review-bot action=result mode=(?:initial|rereview) cycle=\d+ status=failed\]/i;
 
 export class StateStore {
   #file;
@@ -75,7 +76,9 @@ export class StateStore {
       const key = JSON.stringify([prKey, requesterOpenId, mode, resolvedCycle, headSha]);
       const current = state.externalReviewRequests[key];
       state.externalReviewCycles[trackerKey] = { cycle: resolvedCycle, mode, headSha };
-      if (current) return { claimed: false, record: structuredClone(current) };
+      const retryableFailure = current?.status === 'failed'
+        || (current?.status === 'completed' && FAILED_REVIEW_RESULT_PATTERN.test(current.resultMessage || ''));
+      if (current && !retryableFailure) return { claimed: false, record: structuredClone(current) };
       const record = {
         key,
         prKey,
@@ -86,6 +89,7 @@ export class StateStore {
         cycle: resolvedCycle,
         headSha,
         status: 'running',
+        attempts: (current?.attempts || 0) + 1,
         resultMessage: '',
         updatedAt: new Date().toISOString(),
       };
@@ -102,7 +106,7 @@ export class StateStore {
       .map((item) => structuredClone(item));
   }
 
-  async completeExternalReviewRequest(request, resultMessage) {
+  async completeExternalReviewRequest(request, resultMessage, { success = true } = {}) {
     return this.#mutate((state) => {
       const key = request?.key || JSON.stringify([
         request?.prKey,
@@ -115,7 +119,7 @@ export class StateStore {
       if (!current || typeof current !== 'object') throw new Error(`外部审查请求状态不存在: ${key}`);
       const next = {
         ...current,
-        status: 'completed',
+        status: success ? 'completed' : 'failed',
         resultMessage,
         updatedAt: new Date().toISOString(),
       };

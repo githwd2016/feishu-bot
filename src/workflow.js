@@ -35,7 +35,7 @@ export class ReviewWorkflow {
         action: 'result', mode: request.mode, cycle: request.cycle, status: 'failed',
       });
       const message = `${marker} 服务重启中断了审查任务，请重新发起：${request.prUrl || request.prKey}`;
-      await this.store.completeExternalReviewRequest(request, message);
+      await this.store.completeExternalReviewRequest(request, message, { success: false });
       await this.#sendProgress(request.chatId, message,
         [this.#person(request.requesterOpenId, '发起机器人')]);
     }
@@ -371,7 +371,7 @@ export class ReviewWorkflow {
     } catch (error) {
       const marker = buildReviewBotProtocol({ action: 'result', mode, cycle, status: 'failed' });
       const message = `${marker} 审查执行失败，请查看当前机器人日志：${safeError(error)} ${pr.url}`;
-      await this.store.completeExternalReviewRequest(request, message);
+      await this.store.completeExternalReviewRequest(request, message, { success: false });
       await this.feishu.send(event.chatId, message, [requester]);
     }
   }
