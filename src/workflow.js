@@ -35,7 +35,7 @@ export class ReviewWorkflow {
         action: 'result', mode: request.mode, cycle: request.cycle, status: 'failed',
       });
       const message = `${marker} 服务重启中断了审查任务，请重新发起：${request.prUrl || request.prKey}`;
-      await this.store.completeExternalReviewRequest(request, message);
+      await this.store.completeExternalReviewRequest(request, message, { success: false });
       await this.#sendProgress(request.chatId, message,
         [this.#person(request.requesterOpenId, '发起机器人')]);
     }
@@ -361,7 +361,7 @@ export class ReviewWorkflow {
       if (protocol?.action === 'request') {
         await this.store.completeExternalReviewRequest({
           prKey: pr.key, chatId: event.chatId, requesterOpenId: event.senderOpenId, mode, cycle,
-        }, message);
+        }, message, { success: false });
       }
       await this.feishu.send(event.chatId, message, [requester]);
     }
