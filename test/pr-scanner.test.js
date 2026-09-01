@@ -133,6 +133,27 @@ test('scanner reports every failed automatic review attempt and whether it will 
   assert.ok(context.sent.every((item) => item[2][0].openId === LISI.feishuOpenId));
 });
 
+test('scanner sends failures for an unmapped PR author privately to the current reviewer', async (t) => {
+  const context = await makeContext(t);
+  const scanner = makeScanner(context, {
+    people: [SELF],
+    gitcode: {
+      listUserPulls: async ({ scope }) => scope === 'need_my_approve'
+        ? [{ html_url: 'https://gitcode.com/org/repo/pull/1' }]
+        : [],
+      getPr: async () => details('unknown-author', 'assigned-a', ['zhangsan']),
+    },
+    workflow: { reviewAutomatically: async () => { throw new Error('agent failed'); } },
+  });
+
+  await scanner.scanOnce();
+
+  assert.equal(context.sent.length, 1);
+  assert.equal(context.sent[0][0], SELF.feishuOpenId);
+  assert.equal(context.sent[0][3]?.receiveIdType, 'open_id');
+  assert.deepEqual(context.sent[0][2], []);
+});
+
 test('scanner skips a tick while the previous scan is still running', async (t) => {
   const context = await makeContext(t);
   let release;

@@ -73,6 +73,9 @@ export class PrScanner {
         pr,
         headSha,
         responsibility: authorIdentity || this.identities.self,
+        notificationTarget: authorIdentity
+          ? { type: 'chat', id: this.config.feishu.autoReviewChatId }
+          : { type: 'user', id: this.identities.self.feishuOpenId },
         task: (lease) => this.workflow.reviewAutomatically({
           pr,
           authorIdentity,
@@ -164,14 +167,14 @@ export class PrScanner {
     return { pr, details, metadata: gitcodePrMetadata(details) };
   }
 
-  async #runTask(key, { pr, headSha, responsibility, task }) {
+  async #runTask(key, { pr, headSha, responsibility, notificationTarget, task }) {
     const lease = await this.#claim(key);
     if (!lease) return;
     try {
       await task(lease);
       await this.store.completeAutomationTask(key);
     } catch (error) {
-      await this.#recordFailure(key, error, responsibility, pr, headSha);
+      await this.#recordFailure(key, error, responsibility, pr, headSha, notificationTarget);
     }
   }
 
@@ -182,7 +185,7 @@ export class PrScanner {
     });
   }
 
-  async #recordFailure(key, error, responsibility, pr, headSha) {
+  async #recordFailure(key, error, responsibility, pr, headSha, notificationTarget) {
     const state = await this.store.failAutomationTask(key, error, {
       maxAttempts: this.config.scan.maxAttempts,
     });
@@ -191,9 +194,20 @@ export class PrScanner {
     const outcome = state.status === 'exhausted'
       ? '已停止重试'
       : '将在下次定时扫描重试';
-    await this.feishu.send(this.config.feishu.autoReviewChatId,
+    const target = notificationTarget || { type: 'chat', id: this.config.feishu.autoReviewChatId };
+    const mentions = responsibility && target.type === 'chat'
+      ? [{ openId: responsibility.feishuOpenId, name: responsibility.displayName }]
+      : [];
+    if (target.type === 'user' && typeof this.feishu.sendUser === 'function') {
+      await this.feishu.sendUser(target.id,
+        `自动审查失败，本次审查已结束（${attempt}），${outcome}。原因：${String(error?.message || error).slice(0, 500)} ${pr.url}`,
+        mentions);
+      return;
+    }
+    await this.feishu.send(target.id,
       `自动审查失败，本次审查已结束（${attempt}），${outcome}。原因：${String(error?.message || error).slice(0, 500)} ${pr.url}`,
-      responsibility ? [{ openId: responsibility.feishuOpenId, name: responsibility.displayName }] : []);
+      mentions,
+      target.type === 'user' ? { receiveIdType: 'open_id' } : undefined);
   }
 
   async #warnBlocked(key, message) {
