@@ -102,7 +102,7 @@ test('scanner skips WIP PRs in both automatic scopes', async (t) => {
   assert.equal(ownedDispatches.length, 0);
 });
 
-test('scanner retries failed automatic reviews three times and then alerts the responsible user', async (t) => {
+test('scanner reports every failed automatic review attempt and whether it will retry', async (t) => {
   const context = await makeContext(t);
   let attempts = 0;
   const scanner = makeScanner(context, {
@@ -126,8 +126,11 @@ test('scanner retries failed automatic reviews three times and then alerts the r
   await scanner.scanOnce();
 
   assert.equal(attempts, 3);
-  const alert = context.sent.find((item) => String(item[1]).includes('连续失败 3 次'));
-  assert.equal(alert[2][0].openId, LISI.feishuOpenId);
+  assert.equal(context.sent.length, 3);
+  assert.match(context.sent[0][1], /本次审查已结束（commit assigned，第 1\/3 次尝试），将在下次定时扫描重试/);
+  assert.match(context.sent[1][1], /第 2\/3 次尝试/);
+  assert.match(context.sent[2][1], /第 3\/3 次尝试），已停止重试/);
+  assert.ok(context.sent.every((item) => item[2][0].openId === LISI.feishuOpenId));
 });
 
 test('scanner skips a tick while the previous scan is still running', async (t) => {

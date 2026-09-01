@@ -158,8 +158,9 @@ export class ReviewWorkflow {
     }, reviewers, { source: 'automatic', headSha }));
   }
 
-  async reviewAutomatically({ pr, authorIdentity, authorLogin }) {
-    return this.queue.enqueue(pr.key, () => this.#reviewAutomatically(pr, authorIdentity, authorLogin));
+  async reviewAutomatically({ pr, authorIdentity, authorLogin, headSha, attempt, maxAttempts }) {
+    return this.queue.enqueue(pr.key,
+      () => this.#reviewAutomatically(pr, authorIdentity, authorLogin, { headSha, attempt, maxAttempts }));
   }
 
   async #startOwnedReview(pr, event, reviewers, { source, headSha }) {
@@ -376,13 +377,16 @@ export class ReviewWorkflow {
     }
   }
 
-  async #reviewAutomatically(pr, authorIdentity, authorLogin) {
+  async #reviewAutomatically(pr, authorIdentity, authorLogin, attemptDetails) {
     const chatId = this.config.feishu.autoReviewChatId;
-    await this.#sendProgress(chatId, `定时扫描发现分配给当前账号的 PR，正在自动审查：${pr.url}`);
+    const attempt = formatAutomaticReviewAttempt(attemptDetails);
+    const attemptSuffix = attempt ? `（${attempt}）` : '';
+    await this.#sendProgress(chatId,
+      `定时扫描发现分配给当前账号的 PR，正在自动审查${attemptSuffix}：${pr.url}`);
     const output = await this.#runAgentWithHeartbeat({
       chatId,
       pr,
-      action: '正在自动审查',
+      action: `正在自动审查${attemptSuffix}`,
       task: () => this.agent.runReview({
         pr,
         mode: 'initial',
@@ -397,8 +401,9 @@ export class ReviewWorkflow {
       ? `；GitCode 作者 ${authorLogin || '未知'} 未配置飞书映射`
       : '';
     const recipient = hasFindings ? authorIdentity : this.identities.self;
+    const completionDetails = [formatDuration(output.durationMs), attempt].filter(Boolean).join('，');
     await this.feishu.send(chatId,
-      `${finding}（${formatDuration(output.durationMs)}）${mappingNotice}：${pr.url}`,
+      `${finding}（${completionDetails}）${mappingNotice}：${pr.url}`,
       recipient ? [this.#person(recipient.feishuOpenId, recipient.displayName)] : []);
     return output;
   }
@@ -534,6 +539,15 @@ export function reviewerFromIdentity(identity) {
 
 function safeError(error) {
   return String(error?.message || error).slice(0, 1000);
+}
+
+function formatAutomaticReviewAttempt({ headSha, attempt, maxAttempts } = {}) {
+  const parts = [];
+  if (headSha) parts.push(`commit ${String(headSha).slice(0, 8)}`);
+  if (Number.isInteger(attempt) && Number.isInteger(maxAttempts)) {
+    parts.push(`第 ${attempt}/${maxAttempts} 次尝试`);
+  }
+  return parts.join('，');
 }
 
 function formatDuration(durationMs) {

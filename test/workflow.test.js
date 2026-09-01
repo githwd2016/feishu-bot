@@ -225,10 +225,15 @@ test('automatic assigned review with findings mentions the mapped PR author', as
     pr: { owner: 'org', repo: 'repo', repoKey: 'org/repo', key: 'org/repo#8', url: 'https://gitcode.com/org/repo/pull/8', number: 8 },
     authorIdentity: LISI,
     authorLogin: 'lisi',
+    headSha: '1234567890abcdef',
+    attempt: 2,
+    maxAttempts: 3,
   });
 
+  assert.match(context.sent[0][1], /commit 12345678，第 2\/3 次尝试/);
   const final = context.sent.at(-1);
   assert.match(final[1], /2 条待处理/);
+  assert.match(final[1], /commit 12345678，第 2\/3 次尝试/);
   assert.equal(final[2][0].openId, LISI.feishuOpenId);
 });
 
