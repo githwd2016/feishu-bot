@@ -378,13 +378,18 @@ export class ReviewWorkflow {
   }
 
   async #reviewAutomatically(pr, authorIdentity, authorLogin, attemptDetails) {
-    const chatId = this.config.feishu.autoReviewChatId;
+    // A PR author without a Feishu mapping cannot be mentioned in the shared
+    // review group. Keep the automatic review updates private to the current
+    // reviewer instead of posting noise to a group where the author is absent.
+    const target = authorIdentity
+      ? { type: 'chat', id: this.config.feishu.autoReviewChatId }
+      : { type: 'user', id: this.identities.self.feishuOpenId };
     const attempt = formatAutomaticReviewAttempt(attemptDetails);
     const attemptSuffix = attempt ? `（${attempt}）` : '';
-    await this.#sendProgress(chatId,
+    await this.#sendProgress(target,
       `定时扫描发现分配给当前账号的 PR，正在自动审查${attemptSuffix}：${pr.url}`);
     const output = await this.#runAgentWithHeartbeat({
-      chatId,
+      target,
       pr,
       action: `正在自动审查${attemptSuffix}`,
       task: () => this.agent.runReview({
@@ -402,9 +407,9 @@ export class ReviewWorkflow {
       : '';
     const recipient = hasFindings ? authorIdentity : this.identities.self;
     const completionDetails = [formatDuration(output.durationMs), attempt].filter(Boolean).join('，');
-    await this.feishu.send(chatId,
+    await this.#sendNotification(target,
       `${finding}（${completionDetails}）${mappingNotice}：${pr.url}`,
-      recipient ? [this.#person(recipient.feishuOpenId, recipient.displayName)] : []);
+      recipient && authorIdentity ? [this.#person(recipient.feishuOpenId, recipient.displayName)] : []);
     return output;
   }
 
@@ -427,15 +432,18 @@ export class ReviewWorkflow {
     return { openId, name };
   }
 
-  async #runAgentWithHeartbeat({ chatId, pr, action, task }) {
-    return this.agentQueue.enqueue('agent', () => this.#runAgentTaskWithHeartbeat({ chatId, pr, action, task }));
+  async #runAgentWithHeartbeat({ chatId, target, pr, action, task }) {
+    const notificationTarget = target || chatId;
+    return this.agentQueue.enqueue('agent', () => this.#runAgentTaskWithHeartbeat({
+      target: notificationTarget, pr, action, task,
+    }));
   }
 
-  async #runAgentTaskWithHeartbeat({ chatId, pr, action, task }) {
+  async #runAgentTaskWithHeartbeat({ target, pr, action, task }) {
     const startedAt = Date.now();
     const heartbeat = setInterval(() => {
       const elapsed = formatDuration(Date.now() - startedAt);
-      void this.#sendProgress(chatId, `${action}，已运行 ${elapsed}：${pr.url}`);
+      void this.#sendProgress(target, `${action}，已运行 ${elapsed}：${pr.url}`);
     }, PROGRESS_HEARTBEAT_MS);
     heartbeat.unref();
     try {
@@ -447,10 +455,21 @@ export class ReviewWorkflow {
 
   async #sendProgress(chatId, message, mentions = []) {
     try {
-      await this.feishu.send(chatId, message, mentions);
+      await this.#sendNotification(chatId, message, mentions);
     } catch (error) {
       console.warn(`[workflow] 进度消息发送失败: ${safeError(error)}`);
     }
+  }
+
+  async #sendNotification(target, message, mentions = []) {
+    if (target && typeof target === 'object' && target.type === 'user') {
+      if (typeof this.feishu.sendUser === 'function') {
+        return this.feishu.sendUser(target.id, message, mentions);
+      }
+      return this.feishu.send(target.id, message, mentions, { receiveIdType: 'open_id' });
+    }
+    const chatId = target && typeof target === 'object' ? target.id : target;
+    return this.feishu.send(chatId, message, mentions);
   }
 
   async #reportFailure(chatId, pr, error) {

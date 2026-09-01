@@ -256,6 +256,29 @@ test('automatic assigned review without findings mentions the current reviewer',
   assert.equal(final[2][0].openId, SELF.feishuOpenId);
 });
 
+test('automatic assigned review for an unmapped author is sent privately to the current reviewer', async (t) => {
+  const context = await makeContext(t);
+  const workflow = makeWorkflow(context, {
+    agent: {
+      runReview: async () => ({ durationMs: 65_000, result: { unresolvedCount: 2 } }),
+    },
+  });
+
+  await workflow.reviewAutomatically({
+    pr: { owner: 'org', repo: 'repo', repoKey: 'org/repo', key: 'org/repo#8', url: 'https://gitcode.com/org/repo/pull/8', number: 8 },
+    authorIdentity: null,
+    authorLogin: 'unknown-author',
+    headSha: '1234567890abcdef',
+    attempt: 1,
+    maxAttempts: 3,
+  });
+
+  assert.ok(context.sent.length >= 2);
+  assert.ok(context.sent.every((item) => item[0] === SELF.feishuOpenId));
+  assert.ok(context.sent.every((item) => item[3]?.receiveIdType === 'open_id'));
+  assert.match(context.sent.at(-1)[1], /未配置飞书映射/);
+});
+
 test('setup commands report the current chat ID and sender Feishu open ID', async (t) => {
   const context = await makeContext(t);
   const workflow = makeWorkflow(context);

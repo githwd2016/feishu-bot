@@ -16,20 +16,24 @@ export class FeishuGateway {
     return { openId: bot.open_id, name: bot.app_name || this.config.botName };
   }
 
-  async send(chatId, text, mentions = []) {
+  async send(chatId, text, mentions = [], { receiveIdType = 'chat_id' } = {}) {
     const prefix = mentions
       .filter((item) => item?.openId)
       .map((item) => `<at user_id="${escapeAttribute(item.openId)}">${escapeText(item.name || '用户')}</at>`)
       .join(' ');
     const content = prefix ? `${prefix} ${text}` : text;
     await this.client.im.message.create({
-      params: { receive_id_type: 'chat_id' },
+      params: { receive_id_type: receiveIdType },
       data: {
         receive_id: chatId,
         msg_type: 'text',
         content: JSON.stringify({ text: content }),
       },
     });
+  }
+
+  async sendUser(openId, text, mentions = []) {
+    return this.send(openId, text, mentions, { receiveIdType: 'open_id' });
   }
 
   start(onMessage) {
