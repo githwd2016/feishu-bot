@@ -66,15 +66,20 @@ export class PrScanner {
       if (!loaded) return;
       const { pr, metadata } = loaded;
       if (sameLogin(metadata.authorLogin, this.identities.self.gitcodeLogin)) return;
-      const key = `assigned-review|${pr.key}|${requiredHeadSha(metadata, pr)}|${this.identities.self.gitcodeLogin.toLowerCase()}`;
+      const headSha = requiredHeadSha(metadata, pr);
+      const key = `assigned-review|${pr.key}|${headSha}|${this.identities.self.gitcodeLogin.toLowerCase()}`;
       const authorIdentity = this.identities.byGitcodeLogin(metadata.authorLogin);
       await this.#runTask(key, {
         pr,
+        headSha,
         responsibility: authorIdentity || this.identities.self,
-        task: () => this.workflow.reviewAutomatically({
+        task: (lease) => this.workflow.reviewAutomatically({
           pr,
           authorIdentity,
           authorLogin: metadata.authorLogin,
+          headSha,
+          attempt: lease.attempts,
+          maxAttempts: this.config.scan.maxAttempts,
         }),
       });
     } catch (error) {
@@ -133,7 +138,9 @@ export class PrScanner {
         if (!result?.started) throw new Error(`自动分发未启动: ${result?.reason || 'unknown'}`);
         for (const { key } of claimed) await this.store.completeAutomationTask(key);
       } catch (error) {
-        for (const { key } of claimed) await this.#recordFailure(key, error, this.identities.self, pr);
+        for (const { key } of claimed) {
+          await this.#recordFailure(key, error, this.identities.self, pr, headSha);
+        }
       }
     } catch (error) {
       console.error('[scanner] 处理本人 PR 失败:', error);
@@ -157,14 +164,14 @@ export class PrScanner {
     return { pr, details, metadata: gitcodePrMetadata(details) };
   }
 
-  async #runTask(key, { pr, responsibility, task }) {
+  async #runTask(key, { pr, headSha, responsibility, task }) {
     const lease = await this.#claim(key);
     if (!lease) return;
     try {
-      await task();
+      await task(lease);
       await this.store.completeAutomationTask(key);
     } catch (error) {
-      await this.#recordFailure(key, error, responsibility, pr);
+      await this.#recordFailure(key, error, responsibility, pr, headSha);
     }
   }
 
@@ -175,14 +182,17 @@ export class PrScanner {
     });
   }
 
-  async #recordFailure(key, error, responsibility, pr) {
+  async #recordFailure(key, error, responsibility, pr, headSha) {
     const state = await this.store.failAutomationTask(key, error, {
       maxAttempts: this.config.scan.maxAttempts,
     });
     console.error(`[scanner] 自动任务失败 key=${key} attempt=${state.attempts}:`, error);
-    if (state.status !== 'exhausted') return;
+    const attempt = `commit ${shortSha(headSha)}，第 ${state.attempts}/${this.config.scan.maxAttempts} 次尝试`;
+    const outcome = state.status === 'exhausted'
+      ? '已停止重试'
+      : '将在下次定时扫描重试';
     await this.feishu.send(this.config.feishu.autoReviewChatId,
-      `自动审查连续失败 ${state.attempts} 次，已停止重试：${String(error?.message || error).slice(0, 500)} ${pr.url}`,
+      `自动审查失败，本次审查已结束（${attempt}），${outcome}。原因：${String(error?.message || error).slice(0, 500)} ${pr.url}`,
       responsibility ? [{ openId: responsibility.feishuOpenId, name: responsibility.displayName }] : []);
   }
 
@@ -203,4 +213,8 @@ function sameLogin(left, right) {
 function requiredHeadSha(metadata, pr) {
   if (!metadata.headSha) throw new Error(`GitCode PR 未返回 head SHA: ${pr.url}`);
   return metadata.headSha;
+}
+
+function shortSha(headSha) {
+  return String(headSha || '未知').slice(0, 8);
 }
