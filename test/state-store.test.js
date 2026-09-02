@@ -36,6 +36,10 @@ test('StateStore persists PR state and de-duplicates messages', async (t) => {
     prKey: 'a/b#1', prUrl: 'https://gitcode.com/a/b/pull/1', chatId: 'c1',
     requesterOpenId: 'bot', mode: 'rereview', headSha: 'sha-2',
   })).record.cycle, 2);
+  assert.equal((await store.claimExternalReviewRequest({
+    prKey: 'a/b#1', prUrl: 'https://gitcode.com/a/b/pull/1', chatId: 'c1',
+    requesterOpenId: 'bot', mode: 'initial', headSha: 'sha-3',
+  })).record.cycle, 3);
   const lease = await store.claimAutomationTask('review|a/b#1|sha', {
     maxAttempts: 3, staleAfterMs: 60_000,
   });

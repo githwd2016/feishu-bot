@@ -166,6 +166,7 @@ test('plain initial requests replay completed results until the head SHA changes
   headSha = 'sha-2';
   await workflow.onFeishuMessage(request('initial-new-head'));
   assert.equal(reviewCalls, 2);
+  assert.ok(context.sent.some((item) => /action=result mode=initial cycle=1 status=success/.test(String(item[1]))));
 });
 
 test('plain rereview cycles advance only when mode or head SHA changes', async (t) => {
