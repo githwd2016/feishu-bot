@@ -66,16 +66,31 @@ export class StateStore {
       if (!headSha) throw new Error(`外部审查请求缺少 head SHA: ${prUrl || prKey}`);
       const trackerKey = JSON.stringify([prKey, chatId, requesterOpenId]);
       const tracker = normalizeExternalReviewTracker(state.externalReviewCycles[trackerKey]);
+      const matchingRequests = Number.isInteger(cycle)
+        ? []
+        : Object.values(state.externalReviewRequests)
+          .filter((item) => item && typeof item === 'object'
+            && item.prKey === prKey
+            && item.requesterOpenId === requesterOpenId
+            && item.mode === mode
+            && item.headSha === headSha
+            && Number.isInteger(item.cycle))
+          .sort((left, right) => right.cycle - left.cycle);
       const resolvedCycle = Number.isInteger(cycle)
         ? cycle
+        : matchingRequests.length > 0
+          ? matchingRequests[0].cycle
         : tracker?.headSha === headSha && tracker?.mode === mode
           ? tracker.cycle
-          : mode === 'rereview'
-            ? Math.max(1, (tracker?.cycle || 0) + 1)
-            : 0;
+          : tracker
+            ? Math.max(mode === 'rereview' ? 1 : 0, tracker.cycle + 1)
+            : mode === 'rereview' ? 1 : 0;
       const key = JSON.stringify([prKey, requesterOpenId, mode, resolvedCycle, headSha]);
       const current = state.externalReviewRequests[key];
-      state.externalReviewCycles[trackerKey] = { cycle: resolvedCycle, mode, headSha };
+      if (!tracker || resolvedCycle > tracker.cycle
+        || (resolvedCycle === tracker.cycle && tracker.headSha === headSha && tracker.mode === mode)) {
+        state.externalReviewCycles[trackerKey] = { cycle: resolvedCycle, mode, headSha };
+      }
       const retryableFailure = current?.status === 'failed'
         || (current?.status === 'completed' && FAILED_REVIEW_RESULT_PATTERN.test(current.resultMessage || ''));
       if (current && !retryableFailure) return { claimed: false, record: structuredClone(current) };
