@@ -4,14 +4,14 @@ import { PROGRESS_HEARTBEAT_MS } from './progress.js';
 
 const BOT_PROTOCOL_PREFIX = 'review-bot';
 const BOT_PROTOCOL_PATTERN = /\[review-bot action=(request|result) mode=(initial|rereview) cycle=(\d+)(?: status=(success|failed))?\]/i;
-const COMPATIBLE_BOT_FAILURE_PATTERN = /(?:审查|复审|review).{0,16}(?:失败|出错|报错|无法完成|被阻塞|failed|error|blocked)/i;
-const COMPATIBLE_BOT_PROGRESS_PATTERN = /(?:正在|处理中|已收到|开始(?:审查|复审)|稍后|完成后|请(?:审查|复审))/i;
-const COMPATIBLE_BOT_REQUEST_PATTERN = /(?:请|麻烦|帮忙|协助).{0,16}(?:审查|复审|review)|please.{0,16}(?:review|re-review)/i;
-const COMPATIBLE_BOT_BARE_REQUEST_PATTERN = /(?:再次|重新|继续)?(?:审查|复审)(?:一下)?[\s:：，,]*(?:https?:\/\/|\[https?:\/\/)|(?:re-?review|review(?:\s+again)?)[\s:：,]*(?:https?:\/\/|\[https?:\/\/)/i;
+const COMPATIBLE_BOT_FAILURE_PATTERN = /(?:审查|复审|检视|评审|review).{0,16}(?:失败|出错|报错|无法完成|被阻塞|failed|error|blocked)/i;
+const COMPATIBLE_BOT_PROGRESS_PATTERN = /(?:正在|处理中|已收到|开始(?:审查|复审|检视|评审)|稍后|完成后|请(?:审查|复审|检视|评审))/i;
+const COMPATIBLE_BOT_REQUEST_PATTERN = /(?:请|麻烦|帮忙|协助).{0,16}(?:审查|复审|检视|评审|review)|please.{0,16}(?:review|re-review)/i;
+const COMPATIBLE_BOT_BARE_REQUEST_PATTERN = /(?:再次|重新|继续)?(?:审查|复审|检视|评审)(?:一下)?[\s:：，,]*(?:https?:\/\/|\[https?:\/\/)|(?:re-?review|review(?:\s+again)?)[\s:：,]*(?:https?:\/\/|\[https?:\/\/)/i;
 const COMPATIBLE_FEEDBACK_RESOLVED_PATTERN = /(?:审查|review)?(?:意见|评论|comments?).{0,8}(?:(?:均|都|全部)?已|已经)(?:解决|处理|修复|回复)|(?:review\s+)?comments?.{0,8}(?:resolved|addressed|fixed)/i;
 const COMPATIBLE_BOT_SUCCESS_PATTERNS = [
-  /(?:审查|复审)(?:意见|评论)?.{0,8}(?:已提交|提交完成|已完成|完成|完毕)/i,
-  /已(?:完成|结束)(?:本次)?(?:审查|复审)/i,
+  /(?:审查|复审|检视|评审)(?:意见|评论)?.{0,8}(?:已提交|提交完成|已完成|完成|完毕)/i,
+  /已(?:完成|结束)(?:本次)?(?:审查|复审|检视|评审)/i,
   /(?:意见|评论|inline\s+comments?|comments?).{0,8}(?:已提交|提交完成|已发布|发布完成)/i,
   /(?:review).{0,8}(?:completed|done|finished|submitted)/i,
   /(?:comments?).{0,8}(?:submitted|posted|completed)/i,
