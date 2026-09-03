@@ -142,7 +142,8 @@ export class PrScanner {
         for (const { key } of claimed) await this.store.completeAutomationTask(key);
       } catch (error) {
         for (const { key } of claimed) {
-          await this.#recordFailure(key, error, this.identities.self, pr, headSha);
+          if (error?.code === 'TASK_CANCELLED') await this.store.cancelAutomationTask(key, error);
+          else await this.#recordFailure(key, error, this.identities.self, pr, headSha);
         }
       }
     } catch (error) {
@@ -174,6 +175,10 @@ export class PrScanner {
       await task(lease);
       await this.store.completeAutomationTask(key);
     } catch (error) {
+      if (error?.code === 'TASK_CANCELLED') {
+        await this.store.cancelAutomationTask(key, error);
+        return;
+      }
       await this.#recordFailure(key, error, responsibility, pr, headSha, notificationTarget);
     }
   }
