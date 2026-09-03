@@ -3,6 +3,7 @@ import { KeyedQueue } from './keyed-queue.js';
 import { PROGRESS_HEARTBEAT_MS } from './progress.js';
 
 const BOT_PROTOCOL_PREFIX = 'review-bot';
+const TERMINAL_PHASES = new Set(['completed', 'failed', 'cancelled']);
 const BOT_PROTOCOL_PATTERN = /\[review-bot action=(request|result) mode=(initial|rereview) cycle=(\d+)(?: status=(success|failed))?\]/i;
 const COMPATIBLE_BOT_FAILURE_PATTERN = /(?:审查|复审|检视|评审|review).{0,16}(?:失败|出错|报错|无法完成|被阻塞|failed|error|blocked)/i;
 const COMPATIBLE_BOT_PROGRESS_PATTERN = /(?:正在|处理中|已收到|开始(?:审查|复审|检视|评审)|稍后|完成后|请(?:审查|复审|检视|评审))/i;
@@ -27,6 +28,8 @@ export class ReviewWorkflow {
     this.identities = identities;
     this.queue = new KeyedQueue();
     this.agentQueue = new KeyedQueue();
+    this.activeAgentTasks = new Map();
+    this.cancelledAgentKeys = new Set();
   }
 
   async recoverInterruptedTasks() {
@@ -41,7 +44,7 @@ export class ReviewWorkflow {
     }
     for (const savedState of this.store.listPrs()) {
       let state = savedState;
-      if (['completed', 'failed'].includes(state.phase)) continue;
+      if (TERMINAL_PHASES.has(state.phase)) continue;
       if ((!Array.isArray(state.reviewers) || state.reviewers.length === 0)
         && Object.keys(state.pending || {}).length > 0) {
         const migrated = Object.keys(state.pending).map((login) => this.identities.byGitcodeLogin(login));
@@ -96,6 +99,16 @@ export class ReviewWorkflow {
     if (!pr) {
       const active = this.store.findActivePr(event.chatId);
       if (active) pr = parsePrUrl(active.url);
+    }
+    if (isCancellationRequest(event.text) && !isBotSender(event, protocol)) {
+      if (pr) {
+        try { assertAllowedPr(pr, this.config.gitcode.allowedRepos); }
+        catch (error) {
+          await this.feishu.send(event.chatId, error.message, [this.#person(event.senderOpenId, '操作人')]);
+          return;
+        }
+      }
+      return this.#cancelRequestedTask(pr, event);
     }
     try {
       assertAllowedPr(pr, this.config.gitcode.allowedRepos);
@@ -171,11 +184,12 @@ export class ReviewWorkflow {
       return { started: false, reason: 'p2p' };
     }
     const existing = this.store.getPr(pr.key);
-    if (existing && !['completed', 'failed'].includes(existing.phase)) {
+    if (existing && !TERMINAL_PHASES.has(existing.phase)) {
       await this.feishu.send(event.chatId, `该 PR 已在处理中（${existing.phase}）：${pr.url}`,
         [this.#person(event.senderOpenId, this.identities.self.displayName)]);
       return { started: false, reason: 'active' };
     }
+    this.cancelledAgentKeys.delete(pr.key);
     const pending = Object.fromEntries(reviewers.map((reviewer) => [reviewer.id, 'pending']));
     const state = await this.store.putPr({
       key: pr.key,
@@ -213,7 +227,7 @@ export class ReviewWorkflow {
 
   async #handleOwnedPrSignal(pr, event, protocol) {
     const state = this.store.getPr(pr.key);
-    if (!state || ['completed', 'failed'].includes(state.phase)) return;
+    if (!state || TERMINAL_PHASES.has(state.phase)) return;
 
     const reviewer = (state.reviewers || []).find((item) => item.openId === event.senderOpenId);
     if (reviewer) {
@@ -250,7 +264,7 @@ export class ReviewWorkflow {
 
   async #recordReviewerOutcome(pr, reviewerId, success, error) {
     let state = this.store.getPr(pr.key);
-    if (!state || ['completed', 'failed'].includes(state.phase)) return;
+    if (!state || TERMINAL_PHASES.has(state.phase)) return;
     if (!(reviewerId in state.pending)) {
       console.warn(`[workflow] 忽略当前轮次之外的 reviewer: ${reviewerId}`);
       return;
@@ -273,8 +287,10 @@ export class ReviewWorkflow {
   }
 
   async #processReviewRound(pr, state) {
+    if (TERMINAL_PHASES.has(this.store.getPr(pr.key)?.phase)) return;
     await this.#sendProgress(state.chatId, `所有 reviewer 已完成，正在同步 GitCode comments 状态：${pr.url}`);
     const inspection = await this.gitcode.unresolvedSummary(pr);
+    if (TERMINAL_PHASES.has(this.store.getPr(pr.key)?.phase)) return;
     console.log(`[workflow] ${pr.key} comments unresolved=${inspection.unresolvedCount} reviewers=${inspection.unresolvedReviewerLogins.join(',') || '-'}`);
     if (inspection.unresolvedCount === 0) {
       await this.store.updatePr(pr.key, (current) => ({ ...current, phase: 'completed' }));
@@ -298,6 +314,7 @@ export class ReviewWorkflow {
       action: '正在按 review comments 修改代码',
       task: () => this.agent.runAddressFeedback({ pr }),
     });
+    if (TERMINAL_PHASES.has(this.store.getPr(pr.key)?.phase)) return;
 
     const targets = reviewersForLogins(state.reviewers || [], inspection.unresolvedReviewerLogins);
     const pending = Object.fromEntries(targets.map((reviewer) => [reviewer.id, 'pending']));
@@ -349,6 +366,7 @@ export class ReviewWorkflow {
     const { mode, cycle } = request;
     const requesterIsBot = isBotSender(event, protocol);
     const requester = this.#person(event.senderOpenId, requesterIsBot ? '发起机器人' : '发起人');
+    this.cancelledAgentKeys.delete(pr.key);
     await this.#sendProgress(event.chatId, `已收到，正在${mode === 'rereview' ? '复审' : '审查'}，耗时较长时会定期报告进度：${pr.url}`,
       requesterIsBot ? [] : [requester]);
 
@@ -367,9 +385,11 @@ export class ReviewWorkflow {
       const message = output.result.unresolvedCount
         ? `${marker} 审查完成（${formatDuration(output.durationMs)}），当前有 ${output.result.unresolvedCount} 条待处理 inline comments：${pr.url}`
         : `${marker} 审查完成（${formatDuration(output.durationMs)}），未发现待解决问题：${pr.url}`;
-      await this.store.completeExternalReviewRequest(request, message);
+      const completed = await this.store.completeExternalReviewRequest(request, message);
+      if (completed.status === 'cancelled') return;
       await this.feishu.send(event.chatId, message, [requester]);
     } catch (error) {
+      if (isCancellationError(error)) return;
       const marker = buildReviewBotProtocol({ action: 'result', mode, cycle, status: 'failed' });
       const message = `${marker} 审查执行失败，请查看当前机器人日志：${safeError(error)} ${pr.url}`;
       await this.store.completeExternalReviewRequest(request, message, { success: false });
@@ -434,12 +454,14 @@ export class ReviewWorkflow {
 
   async #runAgentWithHeartbeat({ chatId, target, pr, action, task }) {
     const notificationTarget = target || chatId;
-    return this.agentQueue.enqueue('agent', () => this.#runAgentTaskWithHeartbeat({
-      target: notificationTarget, pr, action, task,
-    }));
+    return this.agentQueue.enqueue('agent', () => {
+      if (this.cancelledAgentKeys.delete(pr.key)) throw taskCancellationError();
+      return this.#runAgentTaskWithHeartbeat({ target: notificationTarget, pr, action, task });
+    });
   }
 
   async #runAgentTaskWithHeartbeat({ target, pr, action, task }) {
+    this.activeAgentTasks.set(pr.key, { target, pr });
     const startedAt = Date.now();
     const heartbeat = setInterval(() => {
       const elapsed = formatDuration(Date.now() - startedAt);
@@ -447,9 +469,13 @@ export class ReviewWorkflow {
     }, PROGRESS_HEARTBEAT_MS);
     heartbeat.unref();
     try {
-      return await task();
+      const result = await task();
+      if (this.cancelledAgentKeys.delete(pr.key)) throw taskCancellationError();
+      return result;
     } finally {
       clearInterval(heartbeat);
+      this.cancelledAgentKeys.delete(pr.key);
+      if (this.activeAgentTasks.get(pr.key)?.pr?.key === pr.key) this.activeAgentTasks.delete(pr.key);
     }
   }
 
@@ -476,13 +502,50 @@ export class ReviewWorkflow {
     const reason = safeError(error);
     console.error(`[workflow] ${pr.key} 执行失败:`, error);
     const state = this.store.getPr(pr.key);
-    if (state && !['completed', 'failed'].includes(state.phase)) {
+    if (state?.phase === 'cancelled' || isCancellationError(error)) return;
+    if (state && !TERMINAL_PHASES.has(state.phase)) {
       await this.store.updatePr(pr.key, (current) => ({ ...current, phase: 'failed', lastError: reason }));
     }
     if (chatId) {
       await this.feishu.send(chatId, `执行失败，已停止自动流程，可重新发起。原因：${reason} ${pr.url}`,
         state?.requesterOpenId ? [this.#person(state.requesterOpenId, state.requesterName || '发起人')] : []);
     }
+  }
+
+  async #cancelRequestedTask(pr, event) {
+    const active = pr?.key
+      ? this.activeAgentTasks.get(pr.key)
+      : [...this.activeAgentTasks.values()].find((item) => targetMatchesChat(item.target, event.chatId));
+    const key = pr?.key || active?.pr?.key;
+    if (!pr && active?.pr) pr = active.pr;
+    const state = key ? this.store.getPr(key) : null;
+    const external = this.store.findRunningExternalReview({ chatId: event.chatId, prKey: key });
+    const targetKey = key || external?.prKey;
+    const agentCancelled = typeof this.agent.cancel === 'function' && targetKey
+      ? this.agent.cancel(targetKey)
+      : false;
+    if (!state && !external && !active && !agentCancelled) {
+      await this.feishu.send(event.chatId, '当前没有可取消的审查或修复任务。',
+        [this.#person(event.senderOpenId, '操作人')]);
+      return { cancelled: false, reason: 'not-found' };
+    }
+    if (targetKey) this.cancelledAgentKeys.add(targetKey);
+    if (state && !TERMINAL_PHASES.has(state.phase)) {
+      await this.store.updatePr(state.key, (current) => ({
+        ...current, phase: 'cancelled', lastError: '用户取消了任务',
+      }));
+    }
+    let cancellationMessage;
+    if (external) {
+      const marker = buildReviewBotProtocol({ action: 'result', mode: external.mode,
+        cycle: external.cycle, status: 'failed' });
+      cancellationMessage = `${marker} 审查任务已取消：${external.prUrl}`;
+      await this.store.cancelExternalReviewRequest(external, cancellationMessage);
+    }
+    const url = state?.url || external?.prUrl || pr?.url || targetKey;
+    await this.feishu.send(event.chatId, cancellationMessage || `已取消审查/修复任务：${url}`,
+      [this.#person(event.senderOpenId, '操作人')]);
+    return { cancelled: true, key: targetKey };
   }
 }
 
@@ -514,6 +577,26 @@ function inferReviewMode(text = '') {
   return /复审|rereview/i.test(text) || COMPATIBLE_FEEDBACK_RESOLVED_PATTERN.test(String(text))
     ? 'rereview'
     : 'initial';
+}
+
+export function isCancellationRequest(text = '') {
+  return /(?:取消|停止|终止|中止)\s*(?:审查|复审|检视|评审|修复|修改|任务)?/i.test(String(text))
+    && /(?:取消|停止|终止|中止)/i.test(String(text));
+}
+
+function isCancellationError(error) {
+  return /任务已取消|任务取消|已取消/i.test(String(error?.message || error));
+}
+
+function taskCancellationError() {
+  const error = new Error('任务已取消');
+  error.code = 'TASK_CANCELLED';
+  return error;
+}
+
+function targetMatchesChat(target, chatId) {
+  return (typeof target === 'string' && target === chatId)
+    || (target && ['chat', 'user'].includes(target.type) && target.id === chatId);
 }
 
 function isOpenIdRequest(text = '') {

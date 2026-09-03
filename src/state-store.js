@@ -47,9 +47,19 @@ export class StateStore {
 
   findActivePr(chatId) {
     const matches = Object.values(this.#state.prs).filter(
-      (item) => item.chatId === chatId && !['completed', 'failed'].includes(item.phase),
+      (item) => item.chatId === chatId && !['completed', 'failed', 'cancelled'].includes(item.phase),
     );
     return matches.length === 1 ? structuredClone(matches[0]) : null;
+  }
+
+  findRunningExternalReview({ chatId, requesterOpenId, prKey } = {}) {
+    const matches = Object.values(this.#state.externalReviewRequests)
+      .filter((item) => item && item.status === 'running'
+        && (!chatId || item.chatId === chatId)
+        && (!requesterOpenId || item.requesterOpenId === requesterOpenId)
+        && (!prKey || item.prKey === prKey))
+      .sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')));
+    return matches[0] ? structuredClone(matches[0]) : null;
   }
 
   async claimMessage(messageId) {
@@ -92,6 +102,7 @@ export class StateStore {
         state.externalReviewCycles[trackerKey] = { cycle: resolvedCycle, mode, headSha };
       }
       const retryableFailure = current?.status === 'failed'
+        || current?.status === 'cancelled'
         || (current?.status === 'completed' && FAILED_REVIEW_RESULT_PATTERN.test(current.resultMessage || ''));
       if (current && !retryableFailure) return { claimed: false, record: structuredClone(current) };
       const record = {
@@ -132,10 +143,28 @@ export class StateStore {
       ]);
       const current = state.externalReviewRequests[key];
       if (!current || typeof current !== 'object') throw new Error(`外部审查请求状态不存在: ${key}`);
+      if (current.status === 'cancelled') return structuredClone(current);
       const next = {
         ...current,
         status: success ? 'completed' : 'failed',
         resultMessage,
+        updatedAt: new Date().toISOString(),
+      };
+      state.externalReviewRequests[key] = next;
+      return structuredClone(next);
+    });
+  }
+
+  async cancelExternalReviewRequest(request, resultMessage) {
+    return this.#mutate((state) => {
+      const key = request?.key;
+      const current = state.externalReviewRequests[key];
+      if (!current || typeof current !== 'object') throw new Error(`外部审查请求状态不存在: ${key}`);
+      if (current.status !== 'running') return structuredClone(current);
+      const next = {
+        ...current,
+        status: 'cancelled',
+        resultMessage: resultMessage || current.resultMessage,
         updatedAt: new Date().toISOString(),
       };
       state.externalReviewRequests[key] = next;
@@ -152,7 +181,7 @@ export class StateStore {
     return this.#mutate((state) => {
       const now = Date.now();
       const current = state.automationTasks[key];
-      if (current?.status === 'succeeded' || current?.status === 'exhausted') return null;
+      if (current?.status === 'succeeded' || current?.status === 'exhausted' || current?.status === 'cancelled') return null;
       if (current?.status === 'running') {
         const updatedAt = Date.parse(current.updatedAt || '');
         if (Number.isFinite(updatedAt) && now - updatedAt < staleAfterMs) return null;
@@ -197,6 +226,21 @@ export class StateStore {
         ...current,
         status: current.attempts >= maxAttempts ? 'exhausted' : 'failed',
         lastError: String(error?.message || error).slice(0, 1000),
+        updatedAt: new Date().toISOString(),
+      };
+      state.automationTasks[key] = next;
+      return structuredClone(next);
+    });
+  }
+
+  async cancelAutomationTask(key, reason = '用户取消了任务') {
+    return this.#mutate((state) => {
+      const current = state.automationTasks[key];
+      if (!current) throw new Error(`自动任务状态不存在: ${key}`);
+      const next = {
+        ...current,
+        status: 'cancelled',
+        lastError: String(reason?.message || reason).slice(0, 1000),
         updatedAt: new Date().toISOString(),
       };
       state.automationTasks[key] = next;

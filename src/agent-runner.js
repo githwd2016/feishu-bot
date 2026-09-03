@@ -9,6 +9,14 @@ export class AgentRunner {
   constructor(config, { worktreeManager = new WorktreeManager() } = {}) {
     this.config = config;
     this.worktreeManager = worktreeManager;
+    this.activeTasks = new Map();
+  }
+
+  cancel(prKey) {
+    const controllers = this.activeTasks.get(prKey);
+    if (!controllers) return false;
+    for (const controller of controllers) controller.abort();
+    return controllers.size > 0;
   }
 
   async runReview({ pr, mode, reviewerName }) {
@@ -47,21 +55,32 @@ export class AgentRunner {
   }
 
   async #run({ pr, repository, template, replacements }) {
+    const controller = new AbortController();
+    const controllers = this.activeTasks.get(pr.key) || new Set();
+    controllers.add(controller);
+    this.activeTasks.set(pr.key, controllers);
     const worktreeNotice = repository
       ? '当前目录是机器人为本次任务创建的临时 detached Git worktree。主工作区中的未跟踪文件与本任务无关，不得因此阻塞；不得访问或修改主工作区。'
       : '此 PR 未配置本地仓库。禁止根据当前目录中的本地文件推断 PR 内容，只能使用 GitCode 远端数据完成只读审查。';
-    const run = (workdir) => this.#runInWorkdir({
+    const run = (workdir, signal) => this.#runInWorkdir({
       pr,
       workdir,
       template,
       replacements: { ...replacements, WORKTREE_NOTICE: worktreeNotice },
       usesWorktree: Boolean(repository),
+      signal,
     });
-    if (!repository) return run(this.config.projectRoot);
-    return this.worktreeManager.run({ repository, label: pr.key }, run);
+    try {
+      if (!repository) return await run(this.config.projectRoot, controller.signal);
+      return await this.worktreeManager.run({ repository, label: pr.key },
+        (workdir) => run(workdir, controller.signal));
+    } finally {
+      controllers.delete(controller);
+      if (controllers.size === 0) this.activeTasks.delete(pr.key);
+    }
   }
 
-  async #runInWorkdir({ pr, workdir, template, replacements, usesWorktree }) {
+  async #runInWorkdir({ pr, workdir, template, replacements, usesWorktree, signal }) {
     const backend = this.config.agent.backend;
     const taskName = template.replace(/\.md$/, '');
     const startedAt = Date.now();
@@ -89,8 +108,8 @@ export class AgentRunner {
 
     try {
       const output = backend === 'codex'
-        ? await this.#runCodex({ pr, prompt, workdir, env })
-        : await this.#runOpenCode({ pr, prompt, workdir, env });
+        ? await this.#runCodex({ pr, prompt, workdir, env, signal })
+        : await this.#runOpenCode({ pr, prompt, workdir, env, signal });
       validateAgentResult(output.result, pr);
       if (output.result.status !== 'success') {
         throw new Error(`${backend} 任务被阻塞: ${output.result.blockers.join('; ') || output.result.summary}`);
@@ -112,7 +131,7 @@ export class AgentRunner {
     }
   }
 
-  async #runCodex({ pr, prompt, workdir, env }) {
+  async #runCodex({ pr, prompt, workdir, env, signal }) {
     const settings = this.config.agent.codex;
     const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-codex-'));
     const outputPath = path.join(tempDirectory, 'last-message.json');
@@ -142,6 +161,7 @@ export class AgentRunner {
       const logs = await runProcess({
         bin: settings.bin, args, cwd: workdir, env, stdin: prompt,
         timeoutMs: this.config.agent.timeoutMs,
+        signal,
         onStdout: progress.write,
       });
       let resultText;
@@ -169,7 +189,7 @@ export class AgentRunner {
     }
   }
 
-  async #runOpenCode({ pr, prompt, workdir, env }) {
+  async #runOpenCode({ pr, prompt, workdir, env, signal }) {
     const settings = this.config.agent.opencode;
     const args = ['run', '--format', 'json', '--dir', workdir];
     if (settings.model) args.push('--model', settings.model);
@@ -184,6 +204,7 @@ export class AgentRunner {
     try {
       const logs = await runProcess({
         bin: settings.bin, args, cwd: workdir, env, timeoutMs: this.config.agent.timeoutMs,
+        signal,
         onStdout: progress.write,
       });
       const sessionId = progress.sessionId || extractOpenCodeSessionId(logs.stdout);
@@ -197,6 +218,7 @@ export class AgentRunner {
           cwd: workdir,
           env,
           timeoutMs: Math.min(this.config.agent.timeoutMs, 60_000),
+          signal,
         });
         return {
           stdout: logs.stdout,
@@ -211,8 +233,12 @@ export class AgentRunner {
   }
 }
 
-function runProcess({ bin, args, cwd, env, stdin, timeoutMs, onStdout, onStderr }) {
+function runProcess({ bin, args, cwd, env, stdin, timeoutMs, onStdout, onStderr, signal }) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(cancellationError());
+      return;
+    }
     const child = spawn(bin, args, {
       cwd,
       env,
@@ -223,17 +249,23 @@ function runProcess({ bin, args, cwd, env, stdin, timeoutMs, onStdout, onStderr 
     let stderr = '';
     let timedOut = false;
     let terminalError;
+    let cancelled = false;
     let settled = false;
     let forceKillTimer;
     let exitDrainTimer;
-    const settle = (code, signal) => {
+    const settle = (code, exitSignal) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearTimeout(forceKillTimer);
       clearTimeout(exitDrainTimer);
+      signal?.removeEventListener('abort', onAbort);
       if (timedOut) {
         reject(new Error(`${path.basename(bin)} 运行超过 ${formatDuration(timeoutMs)}，已终止`));
+        return;
+      }
+      if (cancelled) {
+        reject(cancellationError());
         return;
       }
       if (terminalError) {
@@ -244,7 +276,7 @@ function runProcess({ bin, args, cwd, env, stdin, timeoutMs, onStdout, onStderr 
         resolve({ stdout, stderr });
         return;
       }
-      reject(new Error(`${path.basename(bin)} 退出异常 code=${code} signal=${signal || '-'} stderr=${stderr.slice(-2000)}`));
+      reject(new Error(`${path.basename(bin)} 退出异常 code=${code} signal=${exitSignal || '-'} stderr=${stderr.slice(-2000)}`));
     };
     const stopForTerminalError = (error) => {
       if (!(error instanceof Error) || terminalError || timedOut || settled) return;
@@ -262,6 +294,16 @@ function runProcess({ bin, args, cwd, env, stdin, timeoutMs, onStdout, onStderr 
       forceKillTimer = setTimeout(() => terminateProcessTree(child, 'SIGKILL'), 10_000);
       forceKillTimer.unref();
     }, timeoutMs);
+    const onAbort = () => {
+      if (settled || timedOut || cancelled) return;
+      cancelled = true;
+      console.error(`[agent:process] ${path.basename(bin)} 收到取消请求，正在终止进程组`);
+      terminateProcessTree(child, 'SIGTERM');
+      forceKillTimer = setTimeout(() => terminateProcessTree(child, 'SIGKILL'), 10_000);
+      forceKillTimer.unref();
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
     child.stdout.on('data', (chunk) => {
       stdout = appendBounded(stdout, chunk);
       stopForTerminalError(onStdout?.(chunk.toString()));
@@ -281,6 +323,7 @@ function runProcess({ bin, args, cwd, env, stdin, timeoutMs, onStdout, onStderr 
       clearTimeout(timer);
       clearTimeout(forceKillTimer);
       clearTimeout(exitDrainTimer);
+      signal?.removeEventListener('abort', onAbort);
       reject(error);
     });
     child.on('exit', (code, signal) => {
@@ -307,6 +350,12 @@ function terminateProcessTree(child, signal) {
   } catch (error) {
     if (error.code !== 'ESRCH') console.warn(`[agent:process] 无法发送 ${signal}: ${error.message}`);
   }
+}
+
+function cancellationError() {
+  const error = new Error('任务已取消');
+  error.code = 'TASK_CANCELLED';
+  return error;
 }
 
 function createJsonEventProgress({ prefix, summarize, terminalFailure }) {
