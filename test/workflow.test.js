@@ -79,6 +79,31 @@ test('bot protocol requests are persisted and de-duplicated by PR, sender, mode,
   assert.ok(context.sent.some((item) => /action=result mode=initial cycle=4 status=success/.test(String(item[1]))));
 });
 
+test('plain bot requests using 检视 are accepted as review requests', async (t) => {
+  const context = await makeContext(t);
+  let reviewCalls = 0;
+  const workflow = makeWorkflow(context, {
+    gitcode: { getPr: async () => prDetails({ author: 'lisi', assignees: [], sha: '检视-sha' }) },
+    agent: {
+      runReview: async () => {
+        reviewCalls += 1;
+        return { durationMs: 1000, result: { unresolvedCount: 0 } };
+      },
+    },
+  });
+
+  await workflow.onFeishuMessage(message({
+    messageId: 'plain-inspect-request',
+    senderOpenId: LISI.botOpenId,
+    senderType: 'app',
+    text: '@张三bot 受 @张三 委托，请检视此 PR：https://gitcode.com/org/repo/pull/9，评审意见请标注到对应代码行',
+  }));
+
+  assert.equal(reviewCalls, 1);
+  assert.equal(context.sent.length, 2);
+  assert.match(context.sent[1][1], /action=result mode=initial cycle=0 status=success/);
+});
+
 test('a failed bot protocol request can retry the same PR, mode, and cycle', async (t) => {
   const context = await makeContext(t);
   let reviewCalls = 0;
@@ -341,8 +366,11 @@ test('review protocol and third-party result compatibility remain supported', ()
     action: 'result', mode: 'rereview', cycle: 3, status: 'failed',
   });
   assert.equal(parseCompatibleReviewBotResult('已收到，正在审查'), null);
+  assert.equal(parseCompatibleReviewBotResult('已收到，正在检视'), null);
   assert.deepEqual(parseCompatibleReviewBotResult('审查意见已提交'), { status: 'success' });
+  assert.deepEqual(parseCompatibleReviewBotResult('检视意见已提交'), { status: 'success' });
   assert.deepEqual(parseCompatibleReviewBotResult('本次复审执行失败'), { status: 'failed' });
+  assert.deepEqual(parseCompatibleReviewBotResult('本次评审执行失败'), { status: 'failed' });
 });
 
 async function makeContext(t) {
