@@ -7,6 +7,7 @@ import { StateStore } from '../src/state-store.js';
 import {
   ReviewWorkflow,
   buildReviewBotProtocol,
+  isManualReviewCompletionRequest,
   parseCompatibleReviewBotResult,
   parseReviewBotProtocol,
 } from '../src/workflow.js';
@@ -329,6 +330,53 @@ test('manual own-PR dispatch is rejected in a p2p chat', async (t) => {
 
   assert.match(context.sent[0][1], /无法在单聊中完成互审/);
   assert.equal(context.store.getPr('org/repo#7'), null);
+});
+
+test('manual review completion skips missing bot results and starts feedback addressing', async (t) => {
+  const context = await makeContext(t);
+  let addressCalls = 0;
+  const workflow = makeWorkflow(context, {
+    gitcode: {
+      getPr: async () => prDetails({ author: 'zhangsan', assignees: ['lisi', 'wangwu'] }),
+      unresolvedSummary: async () => ({ unresolvedCount: 1, unresolvedReviewerLogins: ['lisi'] }),
+    },
+    agent: {
+      runAddressFeedback: async () => {
+        addressCalls += 1;
+        return { durationMs: 1000, result: { commitSha: '1234567890abcdef' } };
+      },
+    },
+  });
+
+  await workflow.onFeishuMessage(message({
+    messageId: 'manual-review-start', senderOpenId: SELF.feishuOpenId,
+    text: 'https://gitcode.com/org/repo/pull/7',
+  }));
+  await waitFor(() => context.sent.filter(isInitialRequest).length === 2);
+  await workflow.onFeishuMessage(botResult('one-result', LISI.botOpenId, 'initial', 0));
+  await workflow.onFeishuMessage(message({
+    messageId: 'ordinary-human-message', senderOpenId: SELF.feishuOpenId,
+    text: '收到，稍等',
+  }));
+  assert.equal(context.store.getPr('org/repo#7').phase, 'awaiting_review');
+  await workflow.onFeishuMessage(message({
+    messageId: 'manual-review-confirm', senderOpenId: SELF.feishuOpenId,
+    text: '确认审查完成：https://gitcode.com/org/repo/pull/7',
+  }));
+
+  await waitFor(() => context.store.getPr('org/repo#7').phase === 'awaiting_rereview');
+  assert.equal(addressCalls, 1);
+  assert.deepEqual(context.store.getPr('org/repo#7').manualReviewSkippedReviewers, ['wangwu']);
+  assert.ok(context.sent.some((item) => /跳过 1 个未返回结果的 reviewer/.test(String(item[1]))));
+});
+
+test('manual review completion command parser accepts explicit Chinese and English forms', () => {
+  assert.equal(isManualReviewCompletionRequest('确认审查完成'), true);
+  assert.equal(isManualReviewCompletionRequest('人工决定本轮复审结束'), true);
+  assert.equal(isManualReviewCompletionRequest('review completed, start modifying'), true);
+  assert.equal(isManualReviewCompletionRequest('审查完成'), true);
+  assert.equal(isManualReviewCompletionRequest('确认完成'), true);
+  assert.equal(isManualReviewCompletionRequest('收到，正在审查'), false);
 });
 
 test('startup recovery marks interrupted feedback addressing as failed', async (t) => {
