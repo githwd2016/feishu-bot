@@ -1,6 +1,12 @@
 import { assertAllowedPr, gitcodePrMetadata, parsePrUrl } from './pr.js';
 import { KeyedQueue } from './keyed-queue.js';
 import { PROGRESS_HEARTBEAT_MS } from './progress.js';
+import {
+  buildWeeklySummaryPrompt,
+  collectWeeklyCommits,
+  formatWeeklyReport,
+  isWeeklyReportRequest,
+} from './weekly-report.js';
 
 const BOT_PROTOCOL_PREFIX = 'review-bot';
 const TERMINAL_PHASES = new Set(['completed', 'failed', 'cancelled']);
@@ -80,6 +86,10 @@ export class ReviewWorkflow {
     }
 
     const protocol = parseReviewBotProtocol(event.text);
+    if (isWeeklyReportRequest(event.text) && !isBotSender(event, protocol)) {
+      return this.queue.enqueue('weekly-report', () => this.#sendWeeklyReport(event))
+        .catch((error) => this.#reportWeeklyReportFailure(event, error));
+    }
     if (isChatIdRequest(event.text) && !isBotSender(event, protocol)) {
       console.log(`[setup] AUTO_REVIEW_CHAT_ID=${event.chatId}`);
       await this.feishu.send(event.chatId,
@@ -178,6 +188,34 @@ export class ReviewWorkflow {
       chatType: 'group',
       senderOpenId: this.identities.self.feishuOpenId,
     }, reviewers, { source: 'automatic', headSha }));
+  }
+
+  async #sendWeeklyReport(event) {
+    await this.#sendProgress(event.chatId, '正在汇总 REPO_WORKDIRS_JSON 中各仓库的本周提交，请稍候…',
+      [this.#person(event.senderOpenId, '发起人')]);
+    const collected = await collectWeeklyCommits(this.config.gitcode.workdirs);
+    let report;
+    if (typeof this.agent.runWeeklySummary === 'function') {
+      const prompt = buildWeeklySummaryPrompt({
+        ...collected,
+        identities: this.config.identityMappings || [],
+      });
+      const generated = await this.agent.runWeeklySummary({ prompt, data: collected });
+      report = String(generated?.text || generated || '').trim();
+      if (!report) throw new Error('AI 未返回周报正文');
+    } else {
+      report = formatWeeklyReport(collected);
+    }
+    await this.feishu.send(event.chatId, report, [this.#person(event.senderOpenId, '发起人')]);
+    return { sent: true };
+  }
+
+  async #reportWeeklyReportFailure(event, error) {
+    const reason = safeError(error);
+    console.error('[workflow] 生成周报失败:', error);
+    await this.feishu.send(event.chatId, `生成本周提交周报失败：${reason}`,
+      [this.#person(event.senderOpenId, '发起人')]);
+    return { sent: false, reason };
   }
 
   async reviewAutomatically({ pr, authorIdentity, authorLogin, headSha, attempt, maxAttempts }) {

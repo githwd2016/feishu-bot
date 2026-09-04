@@ -46,6 +46,82 @@ export class AgentRunner {
     });
   }
 
+  async runWeeklySummary({ prompt }) {
+    const startedAt = Date.now();
+    const workdir = this.config.projectRoot;
+    const env = {
+      ...process.env,
+      GITCODE_TOKEN: this.config.gitcode.token,
+      GITCODE_API_URL: this.config.gitcode.apiBase,
+      GITCODE_API_BASE: this.config.gitcode.apiBase,
+      GITCODE_ALLOWED_REPOS: [...this.config.gitcode.allowedRepos].join(','),
+      REVIEW_BOT_HELPER: path.join(this.config.projectRoot, 'scripts', 'gitcode-api.js'),
+      REVIEW_BOT_TEMP_WORKTREE: 'false',
+    };
+    const output = this.config.agent.backend === 'codex'
+      ? await this.#runCodexText({ prompt, workdir, env })
+      : await this.#runOpenCodeText({ prompt, workdir, env });
+    const text = String(output.text || '').trim();
+    if (!text) throw new Error(`${this.config.agent.backend} 未返回周报正文`);
+    return { text, sessionId: output.sessionId || null, durationMs: Date.now() - startedAt };
+  }
+
+  async #runCodexText({ prompt, workdir, env }) {
+    const settings = this.config.agent.codex;
+    const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-weekly-'));
+    const outputPath = path.join(tempDirectory, 'last-message.txt');
+    const args = [
+      'exec', '--json', '--skip-git-repo-check', '--cd', workdir,
+      '--output-last-message', outputPath,
+    ];
+    if (settings.bypassApprovalsAndSandbox) args.push('--dangerously-bypass-approvals-and-sandbox');
+    else args.push('--sandbox', 'workspace-write');
+    if (settings.profile) args.push('--profile', settings.profile);
+    if (settings.model) args.push('--model', settings.model);
+    args.push('-');
+    const progress = createJsonEventProgress({
+      prefix: '[agent:codex:weekly-report]',
+      summarize: summarizeCodexEvent,
+      terminalFailure: codexTerminalFailure,
+    });
+    try {
+      await runProcess({
+        bin: settings.bin, args, cwd: workdir, env, stdin: prompt,
+        timeoutMs: this.config.agent.timeoutMs, onStdout: progress.write,
+      });
+      const text = await fs.readFile(outputPath, 'utf8').catch((error) => {
+        if (error.code === 'ENOENT') throw new Error('codex 已结束但未生成周报正文');
+        throw error;
+      });
+      return { text, sessionId: progress.sessionId };
+    } finally {
+      progress.flush();
+      await fs.rm(tempDirectory, { recursive: true, force: true });
+    }
+  }
+
+  async #runOpenCodeText({ prompt, workdir, env }) {
+    const settings = this.config.agent.opencode;
+    const args = ['run', '--format', 'json', '--dir', workdir];
+    if (settings.model) args.push('--model', settings.model);
+    if (settings.agent) args.push('--agent', settings.agent);
+    if (settings.variant) args.push('--variant', settings.variant);
+    if (settings.autoApprove) args.push('--auto');
+    args.push(prompt);
+    const progress = createJsonEventProgress({
+      prefix: '[agent:opencode:weekly-report]', summarize: summarizeOpenCodeEvent,
+    });
+    try {
+      const logs = await runProcess({
+        bin: settings.bin, args, cwd: workdir, env,
+        timeoutMs: this.config.agent.timeoutMs, onStdout: progress.write,
+      });
+      return { text: parseOpenCodeText(logs.stdout), sessionId: progress.sessionId || extractOpenCodeSessionId(logs.stdout) };
+    } finally {
+      progress.flush();
+    }
+  }
+
   #repository(pr, required) {
     const directory = this.config.gitcode.workdirs[pr.repoKey];
     if (required && !directory) {
@@ -484,6 +560,21 @@ export function parseOpenCodeResult(stdout) {
     if (parsed) return parsed;
   }
   throw new Error('OpenCode 没有返回可解析的 JSON 最终结果');
+}
+
+export function parseOpenCodeText(stdout) {
+  const textParts = [];
+  for (const line of String(stdout).split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line);
+      const text = event?.part?.text ?? event?.text ?? event?.content?.text;
+      if (typeof text === 'string' && text.trim()) textParts.push(text.trim());
+    } catch {
+      textParts.push(line.trim());
+    }
+  }
+  return textParts.at(-1) || '';
 }
 
 export function extractOpenCodeSessionId(stdout) {

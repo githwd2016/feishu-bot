@@ -317,6 +317,45 @@ test('setup commands report the current chat ID and sender Feishu open ID', asyn
   assert.match(context.sent[1][1], new RegExp(SELF.feishuOpenId));
 });
 
+test('weekly report command reads only configured repository workdirs', async (t) => {
+  const context = await makeContext(t);
+  const workflow = makeWorkflow(context, {
+    config: { gitcode: { workdirs: { 'org/configured': context.directory } } },
+  });
+
+  await workflow.onFeishuMessage(message({ messageId: 'weekly-report', text: '总结本周提交，形成周报' }));
+
+  assert.equal(context.sent.length, 2);
+  assert.match(context.sent[0][1], /正在汇总/);
+  assert.match(context.sent[1][1], /本周提交周报/);
+  assert.match(context.sent[1][1], /【org\/configured】/);
+  assert.doesNotMatch(context.sent[1][1], /org\/other/);
+});
+
+test('weekly report command uses the configured AI backend for natural-language grouping', async (t) => {
+  const context = await makeContext(t);
+  let prompt = '';
+  const workflow = makeWorkflow(context, {
+    config: {
+      gitcode: { workdirs: { 'org/configured': context.directory } },
+      identityMappings: [SELF, LISI],
+    },
+    agent: {
+      runWeeklySummary: async ({ prompt: received }) => {
+        prompt = received;
+        return { text: '## 张三（zhangsan）\n- 登录：完成登录流程改进。\n\n## 李四（lisi）\n- 本周暂无提交。' };
+      },
+    },
+  });
+
+  await workflow.onFeishuMessage(message({ messageId: 'weekly-ai-report', text: '生成周报' }));
+
+  assert.match(prompt, /zhangsan/);
+  assert.match(prompt, /lisi/);
+  assert.match(context.sent[1][1], /登录：完成登录流程改进/);
+  assert.doesNotMatch(context.sent[1][1], /统计仓库：/);
+});
+
 test('manual own-PR dispatch is rejected in a p2p chat', async (t) => {
   const context = await makeContext(t);
   const workflow = makeWorkflow(context, {
