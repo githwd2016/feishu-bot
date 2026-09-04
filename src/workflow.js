@@ -118,6 +118,15 @@ export class ReviewWorkflow {
     }
 
     const owned = this.store.getPr(pr.key);
+    if (isManualReviewCompletionRequest(event.text) && !isBotSender(event, protocol)) {
+      if (!owned) {
+        await this.feishu.send(event.chatId, `当前没有等待人工确认的审查任务：${pr.url}`,
+          [this.#person(event.senderOpenId, '操作人')]);
+        return;
+      }
+      return this.queue.enqueue(pr.key, () => this.#confirmReviewComplete(pr, event))
+        .catch((error) => this.#reportFailure(event.chatId, pr, error));
+    }
     if (!owned && isBotSender(event, protocol) && !isReviewRequest(event.text, protocol)) {
       console.warn(`[workflow] 忽略无对应任务的机器人状态消息 sender=${event.senderOpenId} pr=${pr.key}`);
       return;
@@ -258,8 +267,54 @@ export class ReviewWorkflow {
       return;
     }
 
-    // 人工 reviewer @ 本机器人时，直接以 GitCode 上的实际 comments 为准。
-    await this.#processReviewRound(pr, state);
+    // 已映射的人工 reviewer @ 本机器人时，保留直接以 GitCode comments
+    // 为准的协作方式；其他普通人工消息需要明确的确认命令。
+    const humanReviewer = (state.reviewers || []).some((item) => {
+      const identity = typeof this.identities.byBotOpenId === 'function'
+        ? this.identities.byBotOpenId(item.openId)
+        : null;
+      return identity?.feishuOpenId === event.senderOpenId;
+    });
+    if (humanReviewer) {
+      await this.#processReviewRound(pr, state);
+      return;
+    }
+    console.log(`[workflow] 忽略未确认的人工消息 pr=${pr.key}`);
+  }
+
+  async #confirmReviewComplete(pr, event) {
+    const state = this.store.getPr(pr.key);
+    if (!state || TERMINAL_PHASES.has(state.phase)) {
+      await this.feishu.send(event.chatId, `该 PR 当前没有等待人工确认的审查任务：${pr.url}`,
+        [this.#person(event.senderOpenId, '操作人')]);
+      return { confirmed: false, reason: 'not-awaiting-review' };
+    }
+    if (!['awaiting_review', 'awaiting_rereview'].includes(state.phase)) {
+      await this.feishu.send(event.chatId,
+        `该 PR 当前处于 ${state.phase}，暂不能人工确认审查完成：${pr.url}`,
+        [this.#person(event.senderOpenId, '操作人')]);
+      return { confirmed: false, reason: 'phase' };
+    }
+
+    const pending = Object.fromEntries(Object.entries(state.pending || {})
+      .map(([reviewerId, status]) => [reviewerId, status === 'pending' ? 'manual_done' : status]));
+    const skippedReviewers = Object.entries(state.pending || {})
+      .filter(([, status]) => status === 'pending')
+      .map(([reviewerId]) => reviewerId);
+    const confirmed = await this.store.updatePr(pr.key, (current) => ({
+      ...current,
+      pending,
+      manualReviewSkippedReviewers: skippedReviewers,
+      manualReviewConfirmedAt: new Date().toISOString(),
+      manualReviewConfirmedBy: event.senderOpenId,
+    }));
+    const pendingCount = Object.values(state.pending || {})
+      .filter((status) => status === 'pending').length;
+    await this.#sendProgress(state.chatId,
+      `已人工确认审查完成${pendingCount ? `（跳过 ${pendingCount} 个未返回结果的 reviewer）` : ''}，正在同步 GitCode comments 状态：${pr.url}`,
+      [this.#person(event.senderOpenId, '操作人')]);
+    await this.#processReviewRound(pr, confirmed);
+    return { confirmed: true, skippedReviewers: pendingCount };
   }
 
   async #recordReviewerOutcome(pr, reviewerId, success, error) {
@@ -288,7 +343,12 @@ export class ReviewWorkflow {
 
   async #processReviewRound(pr, state) {
     if (TERMINAL_PHASES.has(this.store.getPr(pr.key)?.phase)) return;
-    await this.#sendProgress(state.chatId, `所有 reviewer 已完成，正在同步 GitCode comments 状态：${pr.url}`);
+    const manuallySkipped = (state.manualReviewSkippedReviewers || []).length > 0
+      && !Object.values(state.pending || {}).some((status) => status === 'pending');
+    const reviewCompletion = manuallySkipped
+      ? `已人工确认审查完成（跳过 ${(state.manualReviewSkippedReviewers || []).length} 个未返回结果的 reviewer）`
+      : '所有 reviewer 已完成';
+    await this.#sendProgress(state.chatId, `${reviewCompletion}，正在同步 GitCode comments 状态：${pr.url}`);
     const inspection = await this.gitcode.unresolvedSummary(pr);
     if (TERMINAL_PHASES.has(this.store.getPr(pr.key)?.phase)) return;
     console.log(`[workflow] ${pr.key} comments unresolved=${inspection.unresolvedCount} reviewers=${inspection.unresolvedReviewerLogins.join(',') || '-'}`);
@@ -582,6 +642,16 @@ function inferReviewMode(text = '') {
 export function isCancellationRequest(text = '') {
   return /(?:取消|停止|终止|中止)\s*(?:审查|复审|检视|评审|修复|修改|任务)?/i.test(String(text))
     && /(?:取消|停止|终止|中止)/i.test(String(text));
+}
+
+// 人工确认必须是显式命令，避免群内普通消息意外开始修改代码。
+export function isManualReviewCompletionRequest(text = '') {
+  const value = String(text);
+  return /(?:人工|手动|手工)?\s*(?:确认|确定|决定|同意)\s*(?:本轮|此次|这次)?\s*(?:审查|复审|检视|评审|review)\s*(?:已|已经|is\s*)?(?:完成|结束|完毕|complete|completed|done|finished)/i.test(value)
+    || /(?:审查|复审|检视|评审|review)\s*(?:已|已经|is\s*)?(?:完成|结束|完毕|complete|completed|done|finished)\s*(?:[，,:：\s]*(?:确认|开始修改|继续|start\s+modifying))/i.test(value)
+    || /(?:confirm|approve)\s+(?:the\s+)?(?:review|re-?review)\s+(?:is\s+)?(?:complete|completed|done|finished)/i.test(value)
+    || /(?:^|[\s，,:：])(?:人工|手动|手工)?\s*(?:确认|确定)\s*(?:完成|结束|完毕)(?:$|[\s，,:：])/i.test(value)
+    || /(?:^|[\s，,:：])(?:审查|复审|检视|评审|review)\s*(?:已|已经|is\s*)?(?:完成|结束|完毕|complete|completed|done|finished)(?:$|[\s，,:：])/i.test(value);
 }
 
 function isCancellationError(error) {
