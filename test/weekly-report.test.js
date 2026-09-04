@@ -67,9 +67,12 @@ test('weekly summary prompt requires one themed sentence per configured login', 
   const prompt = buildWeeklySummaryPrompt({
     range: { start: new Date('2026-08-30T16:00:00.000Z') },
     current: new Date('2026-09-04T03:00:00.000Z'),
-    identities: [{ displayName: '张三', gitcodeLogin: 'zhangsan' }, { displayName: '李四', gitcodeLogin: 'lisi' }],
+    identities: [
+      { displayName: '张三', gitcodeLogin: 'zhangsan', commit_name: ['Zhang San'] },
+      { displayName: '李四', gitcodeLogin: 'lisi' },
+    ],
     results: [{ repo: 'org/repo', commits: [{
-      author: 'zhangsan', date: '2026-09-01T10:00:00+08:00', subject: 'fix: login timeout',
+      author: 'Zhang San', date: '2026-09-01T10:00:00+08:00', subject: 'fix: login timeout',
       files: ['src/auth.js'], additions: 2, deletions: 1,
     }] }],
   });
@@ -77,4 +80,5 @@ test('weekly summary prompt requires one themed sentence per configured login', 
   assert.match(prompt, /lisi/);
   assert.match(prompt, /按提交主题归类/);
   assert.match(prompt, /每个主题只用一句简短的话/);
+  assert.match(prompt, /"ownerLogin":"zhangsan"/);
 });

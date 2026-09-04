@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { loadConfig, resolveRuntimeIdentities } from '../src/config.js';
 
 const mappings = [
-  { displayName: '张三', feishuOpenId: 'ou_user_zhangsan', gitcodeLogin: 'ZhangSan', botOpenId: 'ou_bot_zhangsan' },
+  { displayName: '张三', feishuOpenId: 'ou_user_zhangsan', gitcodeLogin: 'ZhangSan', commit_name: ['张三提交'], botOpenId: 'ou_bot_zhangsan' },
   { displayName: '李四', feishuOpenId: 'ou_user_lisi', gitcodeLogin: 'lisi', botOpenId: 'ou_bot_lisi' },
 ];
 const baseEnv = {
@@ -18,6 +18,7 @@ test('loadConfig selects Codex by default and configures scanning', () => {
   assert.equal(config.scan.intervalMs, 300_000);
   assert.equal(config.feishu.autoReviewChatId, '');
   assert.equal(config.identityMappings[0].gitcodeLogin, 'ZhangSan');
+  assert.deepEqual(config.identityMappings[0].commit_name, ['张三提交']);
 
   const opencode = loadConfig({ ...baseEnv, AGENT_BACKEND: 'opencode', OPENCODE_AUTO_APPROVE: 'true' });
   assert.equal(opencode.agent.backend, 'opencode');
@@ -34,6 +35,12 @@ test('loadConfig validates identity mappings and rejects obsolete owner/reviewer
   }), /gitcodeLogin 不能重复/);
   assert.throws(() => loadConfig({ ...baseEnv, OWNER_OPEN_ID: 'old-owner' }), /已废弃/);
   assert.throws(() => loadConfig({ ...baseEnv, REVIEWERS_JSON: '[]' }), /已废弃/);
+  assert.throws(() => loadConfig({ ...baseEnv, IDENTITY_MAPPINGS_JSON: JSON.stringify([
+    { ...mappings[0], commit_name: '张三提交' }, mappings[1],
+  ]) }), /commit_name 必须是数组/);
+  assert.throws(() => loadConfig({ ...baseEnv, IDENTITY_MAPPINGS_JSON: JSON.stringify([
+    mappings[0], { ...mappings[1], commit_name: ['张三提交'] },
+  ]) }), /commit_name 不能重复/);
 });
 
 test('loadConfig requires scan interval of at least sixty seconds', () => {

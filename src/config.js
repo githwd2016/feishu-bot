@@ -47,17 +47,47 @@ function normalizeIdentityMappings(env) {
     if (!feishuOpenId || !gitcodeLogin || !botOpenId) {
       throw new Error(`IDENTITY_MAPPINGS_JSON[${index}] 必须包含 feishuOpenId、gitcodeLogin、botOpenId`);
     }
+    const commitNames = mapping?.commit_name === undefined
+      ? []
+      : normalizeCommitNames(mapping.commit_name, index);
     return {
       displayName: String(mapping?.displayName || gitcodeLogin).trim() || gitcodeLogin,
       feishuOpenId,
       gitcodeLogin,
       botOpenId,
+      commit_name: commitNames,
     };
   });
   assertUnique(normalized, 'feishuOpenId', false);
   assertUnique(normalized, 'gitcodeLogin', true);
   assertUnique(normalized, 'botOpenId', false);
+  assertUniqueCommitNames(normalized);
   return normalized;
+}
+
+function normalizeCommitNames(value, index) {
+  if (!Array.isArray(value)) throw new Error(`IDENTITY_MAPPINGS_JSON[${index}].commit_name 必须是数组`);
+  const names = value.map((item) => String(item || '').trim()).filter(Boolean);
+  const seen = new Set();
+  for (const name of names) {
+    const normalized = name.toLowerCase();
+    if (seen.has(normalized)) throw new Error(`IDENTITY_MAPPINGS_JSON[${index}].commit_name 不能重复: ${name}`);
+    seen.add(normalized);
+  }
+  return names;
+}
+
+function assertUniqueCommitNames(items) {
+  const seen = new Map();
+  for (const item of items) {
+    for (const name of item.commit_name) {
+      const normalized = name.toLowerCase();
+      if (seen.has(normalized)) {
+        throw new Error(`IDENTITY_MAPPINGS_JSON 中 commit_name 不能重复: ${name}`);
+      }
+      seen.set(normalized, item.gitcodeLogin);
+    }
+  }
 }
 
 function assertUnique(items, field, caseInsensitive) {

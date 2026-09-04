@@ -50,7 +50,7 @@ GITCODE_ALLOWED_REPOS=example-org/example-repo
 GITCODE_API_BASE=https://api.gitcode.com/api/v5
 REPO_WORKDIRS_JSON={"example-org/example-repo":"/absolute/path/to/example-repo"}
 
-IDENTITY_MAPPINGS_JSON=[{"displayName":"张三","feishuOpenId":"ou_zhangsan_user","gitcodeLogin":"zhangsan","botOpenId":"ou_zhangsan_bot"},{"displayName":"李四","feishuOpenId":"ou_lisi_user","gitcodeLogin":"lisi","botOpenId":"ou_lisi_bot"}]
+IDENTITY_MAPPINGS_JSON=[{"displayName":"张三","feishuOpenId":"ou_zhangsan_user","gitcodeLogin":"zhangsan","commit_name":["张三","zhangsan"],"botOpenId":"ou_zhangsan_bot"},{"displayName":"李四","feishuOpenId":"ou_lisi_user","gitcodeLogin":"lisi","commit_name":["李四"],"botOpenId":"ou_lisi_bot"}]
 
 AUTO_REVIEW_CHAT_ID=oc_target_group
 PR_SCAN_INTERVAL_SECONDS=300
@@ -66,7 +66,10 @@ STATE_FILE=./data/state.json
 - `displayName`：飞书提示中使用的名称，可省略，默认使用 GitCode login；
 - `feishuOpenId`：用于 @ 这个人的飞书用户 open_id；
 - `gitcodeLogin`：用于匹配 PR 作者和审查人，大小写不敏感；
+- `commit_name`：可选的 Git 提交作者名列表，命中其中任意一个名称即归属到该 `gitcodeLogin`，大小写不敏感；
 - `botOpenId`：用于 @ 这个人对应的飞书审查机器人。
+
+在 `.env` 中，`IDENTITY_MAPPINGS_JSON` 可以使用单引号包裹成跨行 JSON；不要直接写未加引号的多行 JSON，否则 dotenv 会在第一行截断变量值。`.env.example` 已提供可直接复制的写法。
 
 三类 ID 必须各自唯一。服务启动时会同时读取飞书 bot 身份和 GitCode `/user`，二者必须命中同一条映射，否则服务会拒绝启动，避免使用错误账号审查。
 
@@ -205,7 +208,7 @@ GitCode created_by_me
 生成周报
 ```
 
-周报只读取 `REPO_WORKDIRS_JSON` 中配置的本地仓库，不会扫描其他目录或 GitCode 仓库。机器人会调用当前配置的 Codex/OpenCode 后端，按 `IDENTITY_MAPPINGS_JSON` 中的每个 `gitcodeLogin` 分组，再按提交主题归类，每个主题输出一句简短的中文总结；没有提交的人员也会保留小节。未配置仓库、作者无法可靠匹配或某个仓库读取失败时，周报会明确显示对应状态。
+周报只读取 `REPO_WORKDIRS_JSON` 中配置的本地仓库，不会扫描其他目录或 GitCode 仓库。机器人会先按 `commit_name`（以及 login/displayName）确定提交归属，再调用当前配置的 Codex/OpenCode 后端，按 `IDENTITY_MAPPINGS_JSON` 中的每个 `gitcodeLogin` 分组、按提交主题归类，每个主题输出一句简短的中文总结；没有提交的人员也会保留小节。未配置仓库、作者无法可靠匹配或某个仓库读取失败时，周报会明确显示对应状态。
 
 ## 状态、去重与恢复
 

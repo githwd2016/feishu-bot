@@ -191,7 +191,7 @@ export class ReviewWorkflow {
   }
 
   async #sendWeeklyReport(event) {
-    await this.#sendProgress(event.chatId, '正在汇总 REPO_WORKDIRS_JSON 中各仓库的本周提交，请稍候…',
+    await this.#sendProgress(event.chatId, '正在汇总各仓库的本周提交，请稍候…',
       [this.#person(event.senderOpenId, '发起人')]);
     const collected = await collectWeeklyCommits(this.config.gitcode.workdirs);
     let report;
