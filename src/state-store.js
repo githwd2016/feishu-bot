@@ -41,6 +41,21 @@ export class StateStore {
     return value ? structuredClone(value) : null;
   }
 
+  automaticOwnedReviewBlockReason(key, { headSha, maxReviewCycles }) {
+    const current = this.#state.prs[key];
+    if (!current) return null;
+    if (!['completed', 'failed', 'cancelled'].includes(current.phase)) return 'active';
+    if (current.phase === 'cancelled') return 'cancelled';
+    // Older state files recorded the round limit only as failed + cycle.
+    // The limit belongs to the PR, so a new head must not reset it implicitly.
+    if (current.stopReason === 'max-review-cycles'
+      || (current.phase === 'failed' && current.cycle >= maxReviewCycles)) {
+      return 'max-review-cycles';
+    }
+    if (current.phase === 'completed' && headSha && current.headSha === headSha) return 'completed';
+    return null;
+  }
+
   listPrs() {
     return Object.values(this.#state.prs).map((value) => structuredClone(value));
   }

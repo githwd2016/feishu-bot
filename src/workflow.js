@@ -224,6 +224,13 @@ export class ReviewWorkflow {
   }
 
   async #startOwnedReview(pr, event, reviewers, { source, headSha }) {
+    // Recheck inside the PR queue: a Feishu round may finish after the scan.
+    if (source === 'automatic') {
+      const reason = this.store.automaticOwnedReviewBlockReason(pr.key, {
+        headSha, maxReviewCycles: this.config.maxReviewCycles,
+      });
+      if (reason) return { started: false, skipped: true, reason };
+    }
     if (event.chatType === 'p2p') {
       await this.feishu.send(event.chatId,
         `PR 审查人使用飞书机器人协作，无法在单聊中完成互审。请在包含全部机器人的群聊中重新发起：${pr.url}`,
@@ -397,7 +404,9 @@ export class ReviewWorkflow {
       return;
     }
     if (state.cycle >= this.config.maxReviewCycles) {
-      await this.store.updatePr(pr.key, (current) => ({ ...current, phase: 'failed' }));
+      await this.store.updatePr(pr.key, (current) => ({
+        ...current, phase: 'failed', stopReason: 'max-review-cycles',
+      }));
       await this.feishu.send(state.chatId,
         `已达到最大复审轮次，仍有 ${inspection.unresolvedCount} 条未解决评论，请人工处理：${pr.url}`,
         [this.#person(state.requesterOpenId, state.requesterName)]);
@@ -420,6 +429,7 @@ export class ReviewWorkflow {
       ...current,
       phase: 'awaiting_rereview',
       cycle: current.cycle + 1,
+      headSha: addressOutput.result.commitSha || current.headSha,
       pending,
     }));
     const commit = addressOutput.result.commitSha ? `，commit ${addressOutput.result.commitSha.slice(0, 8)}` : '';

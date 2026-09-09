@@ -72,6 +72,79 @@ test('scanner refuses partial owned-PR dispatch when an assignee mapping is miss
   assert.equal(context.sent[0][2][0].openId, SELF.feishuOpenId);
 });
 
+test('scanner respects persisted Feishu PR stops before claiming automatic tasks', async (t) => {
+  const context = await makeContext(t);
+  let dispatches = 0;
+  const scanner = makeScanner(context, {
+    gitcode: {
+      listUserPulls: async ({ scope }) => scope === 'created_by_me'
+        ? [{ html_url: 'https://gitcode.com/org/repo/pull/2' }] : [],
+      getPr: async () => details('zhangsan', 'new-head', ['lisi']),
+    },
+    workflow: { startAutomaticOwnedReview: async () => {
+      dispatches += 1;
+      return { started: true };
+    } },
+  });
+  for (const state of [
+    { phase: 'failed', cycle: 3, headSha: 'old-head' },
+    { phase: 'failed', cycle: 1, stopReason: 'max-review-cycles' },
+    { phase: 'cancelled', cycle: 0 },
+    { phase: 'completed', cycle: 1, headSha: 'new-head' },
+    { phase: 'awaiting_rereview', cycle: 1 },
+  ]) {
+    await context.store.putPr({ key: 'org/repo#2', source: 'manual', ...state });
+    await context.store.load();
+    await scanner.scanOnce();
+    assert.equal(dispatches, 0, JSON.stringify(state));
+    assert.equal(context.store.getAutomationTask('owned-dispatch|org/repo#2|new-head|lisi'), null);
+  }
+  // Ordinary failures below the round limit still use the retry mechanism.
+  await context.store.putPr({ key: 'org/repo#2', phase: 'failed', cycle: 1 });
+  await scanner.scanOnce();
+  assert.equal(dispatches, 1);
+  assert.equal(context.sent.length, 0);
+});
+
+test('scanner treats a queued workflow skip as a no-op instead of a failed attempt', async (t) => {
+  const context = await makeContext(t);
+  const scanner = makeScanner(context, {
+    gitcode: {
+      listUserPulls: async ({ scope }) => scope === 'created_by_me'
+        ? [{ html_url: 'https://gitcode.com/org/repo/pull/2' }] : [],
+      getPr: async () => details('zhangsan', 'head', ['lisi']),
+    },
+    workflow: { startAutomaticOwnedReview: async () => ({
+      started: false, skipped: true, reason: 'max-review-cycles',
+    }) },
+  });
+  await scanner.scanOnce();
+  await scanner.scanOnce();
+  assert.equal(context.sent.length, 0);
+  assert.equal(context.store.getAutomationTask('owned-dispatch|org/repo#2|head|lisi').attempts, 1);
+});
+
+test('a completed manual PR can be automatically dispatched for a new head', async (t) => {
+  const context = await makeContext(t);
+  await context.store.putPr({
+    key: 'org/repo#2', phase: 'completed', cycle: 1, headSha: 'reviewed-head', source: 'manual',
+  });
+  let dispatches = 0;
+  const scanner = makeScanner(context, {
+    gitcode: {
+      listUserPulls: async ({ scope }) => scope === 'created_by_me'
+        ? [{ html_url: 'https://gitcode.com/org/repo/pull/2' }] : [],
+      getPr: async () => details('zhangsan', 'new-head', ['lisi']),
+    },
+    workflow: { startAutomaticOwnedReview: async () => {
+      dispatches += 1;
+      return { started: true };
+    } },
+  });
+  await scanner.scanOnce();
+  assert.equal(dispatches, 1);
+});
+
 test('scanner skips WIP PRs in both automatic scopes', async (t) => {
   const context = await makeContext(t);
   const automaticReviews = [];
@@ -191,6 +264,7 @@ function makeScanner(context, { people = [SELF, LISI, WANGWU], gitcode, workflow
       feishu: { autoReviewChatId: 'auto-chat' },
       gitcode: { allowedRepos: new Set(['org/repo']) },
       scan: { intervalMs: 300_000, maxAttempts: 3 },
+      maxReviewCycles: 3,
       agent: { timeoutMs: 1000 },
     },
     store: context.store,
