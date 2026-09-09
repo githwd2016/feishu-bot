@@ -1,37 +1,40 @@
 #!/usr/bin/env node
 import fs from 'node:fs/promises';
-import { GitCodeClient } from '../src/gitcode-client.js';
+import { GitHubClient } from '../src/github-client.js';
 import { assertAllowedPr, parsePrUrl } from '../src/pr.js';
 
 const [command, url, ...args] = process.argv.slice(2);
-const token = process.env.GITCODE_TOKEN;
-if (!token) fail('缺少 GITCODE_TOKEN');
+const token = process.env.GITHUB_TOKEN;
+if (!token) fail('缺少 GITHUB_TOKEN');
 let pr;
 try {
   const allowedRepos = new Set(
-    String(process.env.GITCODE_ALLOWED_REPOS || '').split(',').map((item) => item.trim().toLowerCase()).filter(Boolean),
+    String(process.env.GITHUB_ALLOWED_REPOS || '').split(',').map((item) => item.trim().toLowerCase()).filter(Boolean),
   );
-  if (!allowedRepos.size) throw new Error('缺少 GITCODE_ALLOWED_REPOS');
-  pr = assertAllowedPr(parsePrUrl(url), allowedRepos);
+  if (!allowedRepos.size) throw new Error('缺少 GITHUB_ALLOWED_REPOS');
+  pr = assertAllowedPr(parsePrUrl(url), allowedRepos, 'github');
 } catch (error) {
   fail(error.message);
 }
-const client = new GitCodeClient({
+const client = new GitHubClient({
   token,
-  apiBase: (process.env.GITCODE_API_BASE || 'https://api.gitcode.com/api/v5').replace(/\/$/, ''),
+  apiBase: (process.env.GITHUB_API_BASE || 'https://api.github.com').replace(/\/$/, ''),
 });
 
 try {
   let result;
   switch (command) {
     case 'pr': result = await client.getPr(pr); break;
+    case 'commits': result = await client.listCommits(pr); break;
     case 'files': result = await client.listFiles(pr); break;
     case 'comments': result = await client.listComments(pr); break;
     case 'inline':
       confirmTarget(args, pr);
       result = await client.postInlineComment(pr, {
         path: option(args, '--path'),
-        position: positiveInteger(option(args, '--position'), '--position'),
+        line: positiveInteger(option(args, '--line'), '--line'),
+        side: option(args, '--side'),
+        commitId: option(args, '--commit-id'),
         body: await fs.readFile(option(args, '--body-file'), 'utf8'),
       });
       break;
@@ -48,7 +51,7 @@ try {
       result = await client.setResolved(pr, option(args, '--discussion-id'), true);
       break;
     default:
-      fail('命令必须是 pr、files、comments、inline、reply 或 resolve');
+      fail('命令必须是 pr、files、commits、comments、inline、reply 或 resolve');
   }
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 } catch (error) {

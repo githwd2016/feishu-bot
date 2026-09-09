@@ -32,7 +32,7 @@ function integerAtLeast(env, key, fallback, minimum) {
   return value;
 }
 
-function normalizeIdentityMappings(env) {
+function normalizeIdentityMappings(env, providers) {
   if (env.OWNER_OPEN_ID?.trim() || env.OWNER_NAME?.trim() || env.REVIEWERS_JSON?.trim()) {
     throw new Error('OWNER_OPEN_ID、OWNER_NAME 和 REVIEWERS_JSON 已废弃，请改用 IDENTITY_MAPPINGS_JSON');
   }
@@ -42,24 +42,31 @@ function normalizeIdentityMappings(env) {
   }
   const normalized = mappings.map((mapping, index) => {
     const feishuOpenId = String(mapping?.feishuOpenId || '').trim();
-    const gitcodeLogin = String(mapping?.gitcodeLogin || '').trim();
+    const logins = Object.fromEntries(providers.map((provider) => {
+      const field = `${provider}Login`;
+      return [field, String(mapping?.[field] || '').trim()];
+    }).filter(([, login]) => login));
+    const login = Object.values(logins)[0];
     const botOpenId = String(mapping?.botOpenId || '').trim();
-    if (!feishuOpenId || !gitcodeLogin || !botOpenId) {
-      throw new Error(`IDENTITY_MAPPINGS_JSON[${index}] 必须包含 feishuOpenId、gitcodeLogin、botOpenId`);
+    if (!feishuOpenId || !login || !botOpenId) {
+      throw new Error(`IDENTITY_MAPPINGS_JSON[${index}] 必须包含 feishuOpenId、至少一个已启用平台的 login、botOpenId`);
     }
     const commitNames = mapping?.commit_name === undefined
       ? []
       : normalizeCommitNames(mapping.commit_name, index);
     return {
-      displayName: String(mapping?.displayName || gitcodeLogin).trim() || gitcodeLogin,
+      displayName: String(mapping?.displayName || login).trim() || login,
       feishuOpenId,
-      gitcodeLogin,
+      ...logins,
       botOpenId,
       commit_name: commitNames,
     };
   });
   assertUnique(normalized, 'feishuOpenId', false);
-  assertUnique(normalized, 'gitcodeLogin', true);
+  for (const provider of providers) {
+    const field = `${provider}Login`;
+    assertUnique(normalized.filter((item) => item[field]), field, true);
+  }
   assertUnique(normalized, 'botOpenId', false);
   assertUniqueCommitNames(normalized);
   return normalized;
@@ -85,7 +92,7 @@ function assertUniqueCommitNames(items) {
       if (seen.has(normalized)) {
         throw new Error(`IDENTITY_MAPPINGS_JSON 中 commit_name 不能重复: ${name}`);
       }
-      seen.set(normalized, item.gitcodeLogin);
+      seen.set(normalized, item.feishuOpenId);
     }
   }
 }
@@ -104,31 +111,62 @@ export function loadConfig(env = process.env) {
   if (!['codex', 'opencode'].includes(agentBackend)) {
     throw new Error('AGENT_BACKEND 必须是 codex 或 opencode');
   }
-  const allowedRepos = new Set(
-    required(env, 'GITCODE_ALLOWED_REPOS').split(',').map((item) => item.trim().toLowerCase()).filter(Boolean),
-  );
-  const identityMappings = normalizeIdentityMappings(env);
-
+  const repoProviders = [...new Set((env.REPO_PROVIDERS || 'gitcode').split(',').map((value) => value.trim().toLowerCase()).filter(Boolean))];
+  if (!repoProviders.length || repoProviders.some((provider) => !['gitcode', 'github'].includes(provider))) {
+    throw new Error('REPO_PROVIDERS 必须是 gitcode、github 或 gitcode,github');
+  }
+  const identityMappings = normalizeIdentityMappings(env, repoProviders);
   const workdirs = json(env, 'REPO_WORKDIRS_JSON', {});
+  if (!workdirs || Array.isArray(workdirs) || typeof workdirs !== 'object') throw new Error('REPO_WORKDIRS_JSON 必须是对象');
+  const normalizedWorkdirs = {};
   for (const [repo, directory] of Object.entries(workdirs)) {
-    if (!path.isAbsolute(directory)) throw new Error(`REPO_WORKDIRS_JSON 中 ${repo} 必须使用绝对路径`);
+    if (typeof directory !== 'string' || !path.isAbsolute(directory)) throw new Error(`REPO_WORKDIRS_JSON 中 ${repo} 必须使用绝对路径`);
+    if (!/^(?:(gitcode|github):)?[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(repo)) throw new Error(`REPO_WORKDIRS_JSON 仓库键无效: ${repo}`);
+    normalizedWorkdirs[repo.toLowerCase()] = directory;
+  }
+  const repositories = {};
+  for (const provider of repoProviders) {
+    const prefix = provider.toUpperCase();
+    const allowedRepos = new Set(required(env, `${prefix}_ALLOWED_REPOS`).split(',').map((item) => item.trim().toLowerCase()).filter(Boolean));
+    if (!allowedRepos.size || [...allowedRepos].some((repo) => !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repo))) {
+      throw new Error(`${prefix}_ALLOWED_REPOS 必须包含有效的 owner/repo`);
+    }
+    // Unprefixed keys retain their original GitCode meaning. In GitHub-only
+    // deployments they can also be used for convenience.
+    const platformWorkdirs = {};
+    for (const [key, directory] of Object.entries(normalizedWorkdirs)) {
+      if (!key.includes(':') && (provider === 'gitcode' || repoProviders.length === 1)) platformWorkdirs[key] = directory;
+    }
+    for (const [key, directory] of Object.entries(normalizedWorkdirs)) {
+      if (key.startsWith(`${provider}:`)) platformWorkdirs[key.slice(provider.length + 1)] = directory;
+    }
+    repositories[provider] = {
+      token: required(env, `${prefix}_TOKEN`),
+      apiBase: (env[`${prefix}_API_BASE`] || (provider === 'github' ? 'https://api.github.com' : 'https://api.gitcode.com/api/v5')).replace(/\/$/, ''),
+      allowedRepos,
+      workdirs: platformWorkdirs,
+    };
+  }
+  const weeklyWorkdirs = {};
+  const seenDirectories = new Set();
+  for (const provider of repoProviders) {
+    for (const [repo, directory] of Object.entries(repositories[provider].workdirs)) {
+      if (seenDirectories.has(directory)) continue;
+      weeklyWorkdirs[repoProviders.length > 1 ? `${provider}:${repo}` : repo] = directory;
+      seenDirectories.add(directory);
+    }
   }
 
   return {
     projectRoot,
+    repoProviders,
+    weeklyWorkdirs,
+    ...repositories,
     feishu: {
       appId: required(env, 'FEISHU_APP_ID'),
       appSecret: required(env, 'FEISHU_APP_SECRET'),
       botName: required(env, 'BOT_NAME'),
       autoReviewChatId: env.AUTO_REVIEW_CHAT_ID?.trim() || '',
-    },
-    gitcode: {
-      token: required(env, 'GITCODE_TOKEN'),
-      apiBase: (env.GITCODE_API_BASE || 'https://api.gitcode.com/api/v5').replace(/\/$/, ''),
-      allowedRepos,
-      workdirs: Object.fromEntries(
-        Object.entries(workdirs).map(([repo, directory]) => [repo.toLowerCase(), directory]),
-      ),
     },
     identityMappings,
     scan: {
@@ -157,26 +195,32 @@ export function loadConfig(env = process.env) {
   };
 }
 
-export function resolveRuntimeIdentities(identityMappings, { botIdentity, gitcodeUser }) {
+export function resolveRuntimeIdentities(identityMappings, { botIdentity, gitcodeUser, repositoryUser = gitcodeUser, provider = 'gitcode' }) {
+  const loginField = `${provider}Login`;
+  const label = provider === 'github' ? 'GitHub' : 'GitCode';
   const botOpenId = String(botIdentity?.openId || '').trim();
-  const gitcodeLogin = String(gitcodeUser?.login || '').trim();
+  const login = String(repositoryUser?.login || '').trim();
   if (!botOpenId) throw new Error('无法识别当前飞书 bot open_id');
-  if (!gitcodeLogin) throw new Error('GitCode /user 未返回 login');
+  if (!login) throw new Error(`${label} /user 未返回 login`);
 
   const byBot = identityMappings.find((item) => item.botOpenId === botOpenId);
   if (!byBot) throw new Error(`当前飞书 bot ${botOpenId} 未出现在 IDENTITY_MAPPINGS_JSON 中`);
-  if (byBot.gitcodeLogin.toLowerCase() !== gitcodeLogin.toLowerCase()) {
-    throw new Error(`当前飞书 bot 映射到 ${byBot.gitcodeLogin}，但 GITCODE_TOKEN 属于 ${gitcodeLogin}`);
+  if (!byBot[loginField]) throw new Error(`当前飞书 bot 缺少 ${loginField} 映射`);
+  if (byBot[loginField].toLowerCase() !== login.toLowerCase()) {
+    throw new Error(`当前飞书 bot 映射到 ${byBot[loginField]}，但 ${provider.toUpperCase()}_TOKEN 属于 ${login}`);
   }
 
+  const forPlatform = (item) => item?.[loginField] ? { ...item, login: item[loginField], provider } : null;
+  const byLogin = (login) => {
+    const normalized = String(login || '').trim().toLowerCase();
+    return forPlatform(identityMappings.find((item) => item[loginField]?.toLowerCase() === normalized));
+  };
   return {
-    self: { ...byBot },
-    byGitcodeLogin(login) {
-      const normalized = String(login || '').trim().toLowerCase();
-      return identityMappings.find((item) => item.gitcodeLogin.toLowerCase() === normalized) || null;
-    },
+    self: forPlatform(byBot),
+    byLogin,
+    byGitcodeLogin: byLogin,
     byBotOpenId(openId) {
-      return identityMappings.find((item) => item.botOpenId === openId) || null;
+      return forPlatform(identityMappings.find((item) => item.botOpenId === openId));
     },
   };
 }
