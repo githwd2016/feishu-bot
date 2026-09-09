@@ -629,8 +629,8 @@ function validateAgentResult(result, pr) {
   if (Object.keys(result).some((key) => !allowedKeys.has(key)) || Object.keys(result).length !== allowedKeys.size) {
     throw new Error('agent 返回结果不符合约定字段集合');
   }
-  if (!['success', 'blocked'].includes(result.status)) throw new Error('agent 返回了未知状态');
-  if (!['inspect', 'review', 'address_feedback'].includes(result.action)) throw new Error('agent 返回了未知 action');
+  if (!['success', 'blocked'].includes(result.status)) throw new Error(`agent 返回了未知状态: ${oneLine(result.status)}`);
+  if (!['inspect', 'review', 'address_feedback'].includes(result.action)) throw new Error(`agent 返回了未知 action: ${oneLine(result.action)}`);
   for (const field of ['unresolvedCount', 'commentsPosted', 'commentsReplied', 'commentsResolved']) {
     if (!Number.isInteger(result[field]) || result[field] < 0) throw new Error(`agent 返回的 ${field} 无效`);
   }

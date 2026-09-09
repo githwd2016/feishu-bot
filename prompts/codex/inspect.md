@@ -6,4 +6,4 @@
 
 准确识别需要解决且尚未 resolved 的 review discussions，排除普通 timeline 评论、已解决评论、重复回复和纯信息说明。若插件返回字段不足以判断 resolved 状态，只允许对这个目标 PR 使用 `node "$REVIEW_BOT_HELPER" comments "{{PR_URL}}"` 进行一次窄只读核验。
 
-最终严格按照 output schema 返回 JSON，不要添加 Markdown 代码围栏：`action` 为 `inspect`；`unresolvedCount` 为尚未解决的 review discussions 数；`unresolvedReviewerLogins` 为这些 discussion 发起人的 GitCode login 去重列表；所有写操作计数为 0，`commitSha` 为 null。鉴权失败或无法可靠判断时返回 blocked，禁止猜测。
+最终严格按照 output schema 返回 JSON，不要添加 Markdown 代码围栏：`status` 只能是 `success` 或 `blocked`，成功时必须是 `success`，禁止使用 completed、ok、failed 等其他值；`action` 为 `inspect`；`unresolvedCount` 为尚未解决的 review discussions 数；`unresolvedReviewerLogins` 为这些 discussion 发起人的 GitCode login 去重列表；所有写操作计数为 0，`commitSha` 为 null。鉴权失败或无法可靠判断时返回 blocked，禁止猜测。

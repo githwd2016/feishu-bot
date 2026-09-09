@@ -19,4 +19,4 @@
    fallback 只能用于目标 PR；正文必须先落到临时文件。inline comment 仍必须使用插件，不得走 fallback。
 6. 写操作后重新使用插件读取 comments，核对返回的 `path` 和 `diff_position.start_new_line` 是否与预期文件绝对行号一致。若本轮刚创建的评论锚点错误，先补发并验证正确评论，再回复误发 discussion 说明替代关系，然后 resolve 误发 discussion；最终重新读取 comments，确认只保留有效审查意见为 unresolved。若插件返回内容不足以确认 resolved 状态，可对目标 PR 使用上述 helper 的只读 `comments` 命令核验。
 7. 任何鉴权、写入或关键验证失败都返回 blocked，禁止假报成功。不得输出、记录或把 GITCODE_TOKEN 放进命令行。
-8. 最终严格按照 output schema 返回 JSON，不要添加 Markdown 代码围栏。`unresolvedCount` 必须是任务结束时仍需处理的 review discussions 数量，`unresolvedReviewerLogins` 去重。
+8. 最终严格按照 output schema 返回 JSON，不要添加 Markdown 代码围栏。`status` 只能是 `success` 或 `blocked`，成功时必须是 `success`，禁止使用 completed、ok、failed 等其他值。`unresolvedCount` 必须是任务结束时仍需处理的 review discussions 数量，`unresolvedReviewerLogins` 去重。
