@@ -1,3 +1,5 @@
+import { activeProvider, repositoryConfig } from './repository.js';
+import { assertAllowedPr } from './pr.js';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,6 +10,8 @@ import { WorktreeManager } from './worktree-manager.js';
 export class AgentRunner {
   constructor(config, { worktreeManager = new WorktreeManager() } = {}) {
     this.config = config;
+    this.provider = activeProvider(config);
+    this.repository = repositoryConfig(config);
     this.worktreeManager = worktreeManager;
     this.activeTasks = new Map();
   }
@@ -49,15 +53,7 @@ export class AgentRunner {
   async runWeeklySummary({ prompt }) {
     const startedAt = Date.now();
     const workdir = this.config.projectRoot;
-    const env = {
-      ...process.env,
-      GITCODE_TOKEN: this.config.gitcode.token,
-      GITCODE_API_URL: this.config.gitcode.apiBase,
-      GITCODE_API_BASE: this.config.gitcode.apiBase,
-      GITCODE_ALLOWED_REPOS: [...this.config.gitcode.allowedRepos].join(','),
-      REVIEW_BOT_HELPER: path.join(this.config.projectRoot, 'scripts', 'gitcode-api.js'),
-      REVIEW_BOT_TEMP_WORKTREE: 'false',
-    };
+    const env = this.#environment(false);
     const output = this.config.agent.backend === 'codex'
       ? await this.#runCodexText({ prompt, workdir, env })
       : await this.#runOpenCodeText({ prompt, workdir, env });
@@ -123,7 +119,8 @@ export class AgentRunner {
   }
 
   #repository(pr, required) {
-    const directory = this.config.gitcode.workdirs[pr.repoKey];
+    assertAllowedPr(pr, this.repository.allowedRepos, this.provider);
+    const directory = this.repository.workdirs[pr.repoKey];
     if (required && !directory) {
       throw new Error(`REPO_WORKDIRS_JSON 未配置 ${pr.owner}/${pr.repo} 的本地仓库`);
     }
@@ -137,7 +134,7 @@ export class AgentRunner {
     this.activeTasks.set(pr.key, controllers);
     const worktreeNotice = repository
       ? '当前目录是机器人为本次任务创建的临时 detached Git worktree。主工作区中的未跟踪文件与本任务无关，不得因此阻塞；不得访问或修改主工作区。'
-      : '此 PR 未配置本地仓库。禁止根据当前目录中的本地文件推断 PR 内容，只能使用 GitCode 远端数据完成只读审查。';
+      : '此 PR 未配置本地仓库。禁止根据当前目录中的本地文件推断 PR 内容，只能使用目标代码平台的远端数据完成只读审查。';
     const run = (workdir, signal) => this.#runInWorkdir({
       pr,
       workdir,
@@ -160,20 +157,16 @@ export class AgentRunner {
     const backend = this.config.agent.backend;
     const taskName = template.replace(/\.md$/, '');
     const startedAt = Date.now();
-    const promptPath = path.join(this.config.projectRoot, 'prompts', backend, template);
+    const promptPath = path.join(this.config.projectRoot, 'prompts', this.provider === 'github' ? 'github' : backend, template);
     let prompt = await fs.readFile(promptPath, 'utf8');
-    for (const [key, value] of Object.entries(replacements)) {
+    for (const [key, value] of Object.entries({ ...replacements, PR_KEY: pr.key })) {
       prompt = prompt.replaceAll(`{{${key}}}`, String(value));
     }
-    const env = {
-      ...process.env,
-      GITCODE_TOKEN: this.config.gitcode.token,
-      GITCODE_API_URL: this.config.gitcode.apiBase,
-      GITCODE_API_BASE: this.config.gitcode.apiBase,
-      GITCODE_ALLOWED_REPOS: [...this.config.gitcode.allowedRepos].join(','),
-      REVIEW_BOT_HELPER: path.join(this.config.projectRoot, 'scripts', 'gitcode-api.js'),
-      REVIEW_BOT_TEMP_WORKTREE: usesWorktree ? 'true' : 'false',
-    };
+    if (this.provider === 'github') {
+      const schema = await fs.readFile(path.join(this.config.projectRoot, 'schemas', 'agent-result.schema.json'), 'utf8');
+      prompt += `\n\n最终结果必须符合以下 JSON Schema，所有 required 字段均须填写：\n${schema}`;
+    }
+    const env = this.#environment(usesWorktree);
     console.log(`[agent:${backend}] 开始 ${taskName} ${pr.key} cwd=${workdir} timeout=${formatDuration(this.config.agent.timeoutMs)}`);
     const heartbeat = setInterval(() => {
       const elapsed = Date.now() - startedAt;
@@ -205,6 +198,23 @@ export class AgentRunner {
     } finally {
       clearInterval(heartbeat);
     }
+  }
+
+  #environment(usesWorktree) {
+    const prefix = this.provider.toUpperCase();
+    const env = { ...process.env };
+    // Do not pass credentials for the inactive platform to the task process.
+    for (const key of ['GITCODE_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN']) delete env[key];
+    return {
+      ...env,
+      REPO_PROVIDER: this.provider,
+      [`${prefix}_TOKEN`]: this.repository.token,
+      [`${prefix}_API_BASE`]: this.repository.apiBase,
+      ...(this.provider === 'gitcode' ? { GITCODE_API_URL: this.repository.apiBase } : {}),
+      [`${prefix}_ALLOWED_REPOS`]: [...this.repository.allowedRepos].join(','),
+      REVIEW_BOT_HELPER: path.join(this.config.projectRoot, 'scripts', `${this.provider}-api.js`),
+      REVIEW_BOT_TEMP_WORKTREE: usesWorktree ? 'true' : 'false',
+    };
   }
 
   async #runCodex({ pr, prompt, workdir, env, signal }) {

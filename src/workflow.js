@@ -1,4 +1,5 @@
-import { assertAllowedPr, gitcodePrMetadata, parsePrUrl } from './pr.js';
+import { activeProvider, repositoryConfig, identityLogin, identityByLogin } from './repository.js';
+import { assertAllowedPr, prMetadata, parsePrUrl } from './pr.js';
 import { KeyedQueue } from './keyed-queue.js';
 import { PROGRESS_HEARTBEAT_MS } from './progress.js';
 import {
@@ -25,12 +26,14 @@ const COMPATIBLE_BOT_SUCCESS_PATTERNS = [
   /未发现.{0,8}(?:问题|意见|评论)/i,
 ];
 export class ReviewWorkflow {
-  constructor({ config, store, feishu, agent, gitcode, identities }) {
+  constructor({ config, store, feishu, agent, client, gitcode, identities }) {
     this.config = config;
     this.store = store;
     this.feishu = feishu;
     this.agent = agent;
-    this.gitcode = gitcode;
+    this.client = client || gitcode;
+    this.provider = activeProvider(config);
+    this.repository = repositoryConfig(config);
     this.identities = identities;
     this.queue = new KeyedQueue();
     this.agentQueue = new KeyedQueue();
@@ -40,6 +43,7 @@ export class ReviewWorkflow {
 
   async recoverInterruptedTasks() {
     for (const request of this.store.listRunningExternalReviewRequests()) {
+      if ((parsePrUrl(request.prUrl)?.provider || (request.prKey?.startsWith('github:') ? 'github' : 'gitcode')) !== this.provider) continue;
       const marker = buildReviewBotProtocol({
         action: 'result', mode: request.mode, cycle: request.cycle, status: 'failed',
       });
@@ -49,11 +53,12 @@ export class ReviewWorkflow {
         [this.#person(request.requesterOpenId, '发起机器人')]);
     }
     for (const savedState of this.store.listPrs()) {
+      if ((parsePrUrl(savedState.url)?.provider || 'gitcode') !== this.provider) continue;
       let state = savedState;
       if (TERMINAL_PHASES.has(state.phase)) continue;
       if ((!Array.isArray(state.reviewers) || state.reviewers.length === 0)
         && Object.keys(state.pending || {}).length > 0) {
-        const migrated = Object.keys(state.pending).map((login) => this.identities.byGitcodeLogin(login));
+        const migrated = Object.keys(state.pending).map((login) => identityByLogin(this.identities, login));
         if (migrated.every(Boolean)) {
           state = await this.store.updatePr(state.key, (current) => ({
             ...current,
@@ -77,11 +82,11 @@ export class ReviewWorkflow {
     }
   }
 
-  async onFeishuMessage(event) {
+  async onFeishuMessage(event, contextualPr = null) {
     if (!event.messageId || !event.chatId || !event.senderOpenId) return;
     if (!(await this.store.claimMessage(event.messageId))) return;
     if (event.messageType && event.messageType !== 'text') {
-      await this.feishu.send(event.chatId, '请使用文本消息并附上 GitCode PR 链接。');
+      await this.feishu.send(event.chatId, '请使用文本消息并附上 PR 链接。');
       return;
     }
 
@@ -105,14 +110,14 @@ export class ReviewWorkflow {
       return;
     }
 
-    let pr = parsePrUrl(event.text);
+    let pr = parsePrUrl(event.text) || contextualPr;
     if (!pr) {
       const active = this.store.findActivePr(event.chatId);
       if (active) pr = parsePrUrl(active.url);
     }
     if (isCancellationRequest(event.text) && !isBotSender(event, protocol)) {
       if (pr) {
-        try { assertAllowedPr(pr, this.config.gitcode.allowedRepos); }
+        try { assertAllowedPr(pr, this.repository.allowedRepos, this.provider); }
         catch (error) {
           await this.feishu.send(event.chatId, error.message, [this.#person(event.senderOpenId, '操作人')]);
           return;
@@ -121,7 +126,7 @@ export class ReviewWorkflow {
       return this.#cancelRequestedTask(pr, event);
     }
     try {
-      assertAllowedPr(pr, this.config.gitcode.allowedRepos);
+      assertAllowedPr(pr, this.repository.allowedRepos, this.provider);
     } catch (error) {
       await this.feishu.send(event.chatId, error.message, [this.#person(event.senderOpenId, '发起人')]);
       return;
@@ -163,17 +168,20 @@ export class ReviewWorkflow {
   }
 
   async #startManualRequest(pr, event, protocol) {
-    const details = await this.gitcode.getPr(pr);
-    const metadata = gitcodePrMetadata(details);
-    if (metadata.authorLogin.toLowerCase() !== this.identities.self.gitcodeLogin.toLowerCase()) {
+    const details = await this.client.getPr(pr);
+    const metadata = prMetadata(details, this.provider);
+    if (metadata.authorLogin.toLowerCase() !== identityLogin(this.identities.self).toLowerCase()) {
       const request = await this.#claimExternalReview(pr, event, protocol, metadata);
       if (!request) return;
       return this.#reviewForExternalRequester(pr, event, protocol, request);
     }
+    if (this.provider === 'github' && details.requested_teams?.length) {
+      throw new Error('GitHub 团队审查请求暂不支持自动分发，请在 PR Reviewers 中指定个人');
+    }
     const reviewers = this.#reviewersForAssignees(metadata.assigneeLogins);
     if (reviewers.missing.length > 0 || reviewers.matched.length === 0) {
       const reason = reviewers.missing.length
-        ? `以下 GitCode 审查人缺少三方映射：${reviewers.missing.join(', ')}`
+        ? `以下审查人缺少三方映射：${reviewers.missing.join(', ')}`
         : '该 PR 尚未配置其他审查人';
       await this.feishu.send(event.chatId, `${reason}：${pr.url}`,
         [this.#person(event.senderOpenId, this.identities.self.displayName)]);
@@ -193,7 +201,7 @@ export class ReviewWorkflow {
   async #sendWeeklyReport(event) {
     await this.#sendProgress(event.chatId, '正在汇总各仓库的本周提交，请稍候…',
       [this.#person(event.senderOpenId, '发起人')]);
-    const collected = await collectWeeklyCommits(this.config.gitcode.workdirs);
+    const collected = await collectWeeklyCommits(this.config.weeklyWorkdirs || this.repository.workdirs);
     let report;
     if (typeof this.agent.runWeeklySummary === 'function') {
       const prompt = buildWeeklySummaryPrompt({
@@ -312,7 +320,7 @@ export class ReviewWorkflow {
       return;
     }
 
-    // 已映射的人工 reviewer @ 本机器人时，保留直接以 GitCode comments
+    // 已映射的人工 reviewer @ 本机器人时，保留直接以远端 comments
     // 为准的协作方式；其他普通人工消息需要明确的确认命令。
     const humanReviewer = (state.reviewers || []).some((item) => {
       const identity = typeof this.identities.byBotOpenId === 'function'
@@ -356,7 +364,7 @@ export class ReviewWorkflow {
     const pendingCount = Object.values(state.pending || {})
       .filter((status) => status === 'pending').length;
     await this.#sendProgress(state.chatId,
-      `已人工确认审查完成${pendingCount ? `（跳过 ${pendingCount} 个未返回结果的 reviewer）` : ''}，正在同步 GitCode comments 状态：${pr.url}`,
+      `已人工确认审查完成${pendingCount ? `（跳过 ${pendingCount} 个未返回结果的 reviewer）` : ''}，正在同步远端 comments 状态：${pr.url}`,
       [this.#person(event.senderOpenId, '操作人')]);
     await this.#processReviewRound(pr, confirmed);
     return { confirmed: true, skippedReviewers: pendingCount };
@@ -393,8 +401,8 @@ export class ReviewWorkflow {
     const reviewCompletion = manuallySkipped
       ? `已人工确认审查完成（跳过 ${(state.manualReviewSkippedReviewers || []).length} 个未返回结果的 reviewer）`
       : '所有 reviewer 已完成';
-    await this.#sendProgress(state.chatId, `${reviewCompletion}，正在同步 GitCode comments 状态：${pr.url}`);
-    const inspection = await this.gitcode.unresolvedSummary(pr);
+    await this.#sendProgress(state.chatId, `${reviewCompletion}，正在同步远端 comments 状态：${pr.url}`);
+    const inspection = await this.client.unresolvedSummary(pr);
     if (TERMINAL_PHASES.has(this.store.getPr(pr.key)?.phase)) return;
     console.log(`[workflow] ${pr.key} comments unresolved=${inspection.unresolvedCount} reviewers=${inspection.unresolvedReviewerLogins.join(',') || '-'}`);
     if (inspection.unresolvedCount === 0) {
@@ -441,8 +449,8 @@ export class ReviewWorkflow {
 
   async #claimExternalReview(pr, event, protocol, loadedMetadata) {
     const mode = protocol?.action === 'request' ? protocol.mode : inferReviewMode(event.text);
-    const metadata = loadedMetadata || gitcodePrMetadata(await this.gitcode.getPr(pr));
-    if (!metadata.headSha) throw new Error(`GitCode PR 未返回 head SHA: ${pr.url}`);
+    const metadata = loadedMetadata || prMetadata(await this.client.getPr(pr), this.provider);
+    if (!metadata.headSha) throw new Error(`PR 未返回 head SHA: ${pr.url}`);
     const claim = await this.store.claimExternalReviewRequest({
       prKey: pr.key,
       prUrl: pr.url,
@@ -531,7 +539,7 @@ export class ReviewWorkflow {
       ? `已提交审查意见，当前有 ${output.result.unresolvedCount} 条待处理 inline comments`
       : '审查完成，未发现待解决问题';
     const mappingNotice = hasFindings && !authorIdentity
-      ? `；GitCode 作者 ${authorLogin || '未知'} 未配置飞书映射`
+      ? `；PR 作者 ${authorLogin || '未知'} 未配置飞书映射`
       : '';
     const recipient = hasFindings ? authorIdentity : this.identities.self;
     const completionDetails = [formatDuration(output.durationMs), attempt].filter(Boolean).join('，');
@@ -545,8 +553,8 @@ export class ReviewWorkflow {
     const matched = [];
     const missing = [];
     for (const login of assigneeLogins) {
-      if (login.toLowerCase() === this.identities.self.gitcodeLogin.toLowerCase()) continue;
-      const identity = this.identities.byGitcodeLogin(login);
+      if (login.toLowerCase() === identityLogin(this.identities.self).toLowerCase()) continue;
+      const identity = identityByLogin(this.identities, login);
       if (!identity) {
         missing.push(login);
         continue;
@@ -744,16 +752,17 @@ function isBotSender(event, protocol) {
 
 function reviewersForLogins(reviewers, reviewerLogins) {
   const logins = new Set(reviewerLogins.map((item) => item.toLowerCase()).filter(Boolean));
-  const matched = reviewers.filter((reviewer) => reviewer.gitcodeLogin && logins.has(reviewer.gitcodeLogin.toLowerCase()));
+  const matched = reviewers.filter((reviewer) => identityLogin(reviewer) && logins.has(identityLogin(reviewer).toLowerCase()));
   return matched.length > 0 ? matched : reviewers;
 }
 
 export function reviewerFromIdentity(identity) {
   return {
-    id: identity.gitcodeLogin.toLowerCase(),
+    id: identityLogin(identity).toLowerCase(),
     name: `${identity.displayName} bot`,
     openId: identity.botOpenId,
-    gitcodeLogin: identity.gitcodeLogin,
+    ...(identity.provider === 'github' || (!identity.gitcodeLogin && identity.githubLogin)
+      ? { githubLogin: identityLogin(identity) } : { gitcodeLogin: identityLogin(identity) }),
   };
 }
 

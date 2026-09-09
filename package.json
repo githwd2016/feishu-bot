@@ -2,13 +2,13 @@
   "name": "feishu-gitcode-review-bot",
   "version": "1.0.0",
   "private": true,
-  "description": "Feishu to GitCode automated review and feedback loop",
+  "description": "Feishu automated review and feedback loop for GitCode and GitHub",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
     "test": "node --test",
-    "check": "node --check src/index.js && node --check src/config.js && node --check src/gitcode-client.js && node --check src/pr-scanner.js && node --check src/state-store.js && node --check src/workflow.js && node --check src/weekly-report.js && node --check src/agent-runner.js && node --check scripts/gitcode-api.js"
+    "check": "node --check src/index.js && node --check src/config.js && node --check src/gitcode-client.js && node --check src/pr-scanner.js && node --check src/state-store.js && node --check src/workflow.js && node --check src/weekly-report.js && node --check src/agent-runner.js && node --check scripts/gitcode-api.js && node --check src/github-client.js && node --check src/repository.js && node --check src/pr.js && node --check scripts/github-api.js && node --check src/platform-router.js"
   },
   "engines": {
     "node": ">=20"

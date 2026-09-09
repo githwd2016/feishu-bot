@@ -1,6 +1,8 @@
-# 飞书 × GitCode 自动 Review Bot
+# 飞书 × GitCode / GitHub 自动 Review Bot
 
-机器人既支持在飞书群内通过 `@机器人 + GitCode PR 链接` 手动发起审查，也会定时扫描当前 `GITCODE_TOKEN` 账号的 PR 待办：
+同一个机器人实例可以同时处理 GitCode 和 GitHub 仓库：在飞书群中通过 `@机器人 + PR 链接` 发起审查，或定时扫描两个平台上当前账号的 PR 待办。原有 GitCode 配置默认保持兼容。
+
+GitCode 扫描规则：
 
 自动扫描会跳过标记为 Draft/WIP 的 PR；手动发起审查不受此限制。
 
@@ -9,13 +11,13 @@
 - 审查意见产生后，PR 作者的机器人会自动修改、测试、提交、回复并请求原审查人复审；
 - 全部意见解决后只通知可以合入，不自动执行评审通过或合并。
 
-支持 Codex + GitCode 插件和 OpenCode 两种 agent 后端。
+支持 Codex 和 OpenCode 两种 agent 后端。GitCode 的 Codex 任务使用已安装插件；GitHub 任务在两种后端中都使用项目内的 GitHub helper。GitHub 根据个人 Reviewers 请求发现待审 PR，不能把 Assignees 当作审查人。
 
 ## 运行要求
 
 - Node.js 20+
-- GitCode Personal Access Token
-- Codex CLI（并启用 GitCode 插件）或 OpenCode CLI
+- 每个启用平台对应的个人 Personal Access Token
+- Codex CLI（处理 GitCode 时启用 GitCode 插件）或 OpenCode CLI
 - 需要自动修改的仓库本地 checkout
 - 能长期运行 Node 服务的主机
 
@@ -59,19 +61,47 @@ MAX_REVIEW_CYCLES=3
 STATE_FILE=./data/state.json
 ```
 
+### 同一实例启用 GitCode 和 GitHub
+
+在现有配置上增加以下设置，无需启动第二个飞书机器人进程：
+
+```dotenv
+REPO_PROVIDERS=gitcode,github
+GITHUB_TOKEN=xxx
+GITHUB_ALLOWED_REPOS=example-org/example-repo
+GITHUB_API_BASE=https://api.github.com
+REPO_WORKDIRS_JSON={"example-org/example-repo":"/absolute/path/to/gitcode-repo","github:example-org/example-repo":"/absolute/path/to/github-repo"}
+IDENTITY_MAPPINGS_JSON='[
+  {"displayName":"张三","feishuOpenId":"ou_zhangsan_user","gitcodeLogin":"zhangsan","githubLogin":"zhangsan-gh","commit_name":["张三"],"botOpenId":"ou_zhangsan_bot"},
+  {"displayName":"李四","feishuOpenId":"ou_lisi_user","gitcodeLogin":"lisi","githubLogin":"lisi-gh","commit_name":["李四"],"botOpenId":"ou_lisi_bot"}
+]'
+```
+
+`REPO_PROVIDERS` 默认为 `gitcode`；也可设为 `github`，此时不需要 GitCode token、白名单或 login。双平台模式下，两套 token 分别通过各自 `/user` 验证，必须都属于当前 bot 对应的人。其他参与者可以只填写其使用平台的 login；审查人缺少该平台映射时不会进行部分分发。
+
+白名单按平台独立配置。双平台模式中，`REPO_WORKDIRS_JSON` 的旧键 `owner/repo` 仍属于 GitCode；GitHub 使用 `github:owner/repo`，GitCode 也可显式使用 `gitcode:owner/repo`。仅启用 GitHub 时允许使用无前缀键。两个平台存在同名仓库时应配置各自的 checkout。周报汇总所有已配置平台的本地仓库，相同目录路径只统计一次。
+
+GitHub 配置面向 **github.com**，暂不支持 GitHub Enterprise Server 自定义网页域名。token 需能读取目标仓库、PR 和审查讨论；发布/回复/解决讨论需要 Pull requests 写权限。自动修复还需要独立可用的 Git fetch/push 凭据（SSH 或 credential helper）；不会将 API token 拼进 git 命令。具体权限参见 [GitHub review comments API](https://docs.github.com/en/rest/pulls/comments)。
+
+GitHub 扫描按白名单仓库分页读取开放 PR：个人 `requested_reviewers` 中包含当前账号的 PR 会自动审查，本人创建的 PR 会分发给已请求或已提交过审查的个人 reviewer。Draft/WIP 自动跳过。团队 Reviewers 暂不自动展开；本人 PR 有团队审查请求时会提示改为个人 Reviewers。讨论是否解决由 [GitHub GraphQL review threads](https://docs.github.com/en/graphql/reference/pulls) 确定，过期讨论不会被当作已解决。完整读取失败会阻塞任务，不会把结果当作零条意见。
+
+GitHub 审查、回复、自动修复和复审沿用现有飞书指令及机器人消息协议。任务状态保留旧 GitCode 键 `owner/repo#number`，GitHub 使用 `github:owner/repo#number`，避免同名 PR 冲突。两个平台独立扫描，其中一个平台扫描失败不会阻止另一个平台继续。会话中只有一个任务时仍可不带链接发送取消/确认命令；有多个任务时必须附上目标 PR 链接。
+
+GitHub helper 提供 `pr`、`files`、`commits`、`comments`、`inline`、`reply`、`resolve`。写操作的 `--confirm-target` 必须包含平台前缀（例如 `github:owner/repo#42`），回复和解决讨论会再次校验 discussion 属于精确 PR。行内评论使用 `--line`、`--side LEFT|RIGHT` 和所审查的 `--commit-id`；head 已改变则拒绝发布。GitHub fork PR 的审查从 base 仓库 `refs/pull/<number>/head` 读取，修复仅推送到元数据指定的源仓库和源分支，无权限时返回 blocked。
+
 ### 三方身份映射
 
 `IDENTITY_MAPPINGS_JSON` 是唯一的用户和机器人身份配置，直接替代旧版的 `OWNER_OPEN_ID`、`OWNER_NAME` 和 `REVIEWERS_JSON`：
 
 - `displayName`：飞书提示中使用的名称，可省略，默认使用 GitCode login；
 - `feishuOpenId`：用于 @ 这个人的飞书用户 open_id；
-- `gitcodeLogin`：用于匹配 PR 作者和审查人，大小写不敏感；
+- `gitcodeLogin` / `githubLogin`：用于匹配对应平台的 PR 作者和审查人，大小写不敏感；
 - `commit_name`：可选的 Git 提交作者名列表，命中其中任意一个名称即归属到该 `gitcodeLogin`，大小写不敏感；
 - `botOpenId`：用于 @ 这个人对应的飞书审查机器人。
 
 在 `.env` 中，`IDENTITY_MAPPINGS_JSON` 可以使用单引号包裹成跨行 JSON；不要直接写未加引号的多行 JSON，否则 dotenv 会在第一行截断变量值。`.env.example` 已提供可直接复制的写法。
 
-三类 ID 必须各自唯一。服务启动时会同时读取飞书 bot 身份和 GitCode `/user`，二者必须命中同一条映射，否则服务会拒绝启动，避免使用错误账号审查。
+飞书用户 ID、bot ID 和各平台的 login 必须分别唯一。服务启动时读取飞书 bot 身份和每个已启用平台的 `/user`，必须命中同一条映射，否则拒绝启动。
 
 旧版 owner/reviewer 变量不再兼容，`local` reviewer 模式也已移除。
 
@@ -244,7 +274,7 @@ GitCode created_by_me
 
 ## 安全边界与排障
 
-- 所有 PR 必须属于 `GITCODE_ALLOWED_REPOS`；
+- 所有 PR 必须属于对应平台的 `GITCODE_ALLOWED_REPOS` 或 `GITHUB_ALLOWED_REPOS`；
 - `REPO_WORKDIRS_JSON` 必须使用仓库根目录的绝对路径，只用于创建临时 detached worktree；
 - helper 写操作会再次校验精确的仓库和 PR；
 - 服务不会 force push，也不会自动合并；
@@ -266,6 +296,8 @@ src/                    飞书、扫描器、状态机和 agent runner
 prompts/codex/          Codex 任务提示
 prompts/opencode/       OpenCode 任务提示
 scripts/gitcode-api.js  GitCode 白名单 helper
+scripts/github-api.js   GitHub 白名单 helper
+prompts/github/        两种 agent 共用的 GitHub 任务提示
 schemas/                agent 结构化结果定义
 test/                   单元与流程测试
 ```
