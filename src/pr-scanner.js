@@ -6,8 +6,6 @@ import {
 } from './pr.js';
 import { reviewerFromIdentity } from './workflow.js';
 
-const ACTIVE_PHASES = new Set(['awaiting_review', 'addressing_feedback', 'awaiting_rereview']);
-
 export class PrScanner {
   #running = false;
   #timer;
@@ -96,8 +94,10 @@ export class PrScanner {
       if (!loaded) return;
       const { pr, metadata } = loaded;
       if (!sameLogin(metadata.authorLogin, this.identities.self.gitcodeLogin)) return;
-      const active = this.store.getPr(pr.key);
-      if (active && ACTIVE_PHASES.has(active.phase)) return;
+      if (this.store.automaticOwnedReviewBlockReason(pr.key, {
+        headSha: metadata.headSha,
+        maxReviewCycles: this.config.maxReviewCycles,
+      })) return;
 
       const reviewerLogins = metadata.assigneeLogins.filter(
         (login) => !sameLogin(login, this.identities.self.gitcodeLogin),
@@ -138,7 +138,7 @@ export class PrScanner {
           headSha,
           reviewers: claimed.map((item) => item.reviewer),
         });
-        if (!result?.started) throw new Error(`自动分发未启动: ${result?.reason || 'unknown'}`);
+        if (!result?.started && !result?.skipped) throw new Error(`自动分发未启动: ${result?.reason || 'unknown'}`);
         for (const { key } of claimed) await this.store.completeAutomationTask(key);
       } catch (error) {
         for (const { key } of claimed) {

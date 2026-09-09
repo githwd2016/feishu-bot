@@ -4,6 +4,8 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { StateStore } from '../src/state-store.js';
+import { PrScanner } from '../src/pr-scanner.js';
+import { parsePrUrl } from '../src/pr.js';
 import {
   ReviewWorkflow,
   buildReviewBotProtocol,
@@ -55,6 +57,76 @@ test('owned PR uses GitCode assignees, fixes feedback, and rereviews the origina
   await workflow.onFeishuMessage(botResult('lisi-rereview', LISI.botOpenId, 'rereview', 1));
   await waitFor(() => context.store.getPr('org/repo#7').phase === 'completed');
   assert.ok(context.sent.some((item) => String(item[1]).includes('可以合入')));
+});
+
+test('Feishu round exhaustion survives scans, queued automatic starts, and reloads', async (t) => {
+  const context = await makeContext(t);
+  const pr = parsePrUrl('https://gitcode.com/org/repo/pull/7');
+  let headSha = 'initial-head';
+  let addressCalls = 0;
+  const workflow = makeWorkflow(context, {
+    config: { maxReviewCycles: 1, scan: { maxAttempts: 3 }, agent: { timeoutMs: 1000 } },
+    gitcode: {
+      getPr: async () => prDetails({ author: 'zhangsan', assignees: ['lisi'], sha: headSha }),
+      listUserPulls: async ({ scope }) => scope === 'created_by_me' ? [{ html_url: pr.url }] : [],
+      unresolvedSummary: async () => ({ unresolvedCount: 1, unresolvedReviewerLogins: ['lisi'] }),
+    },
+    agent: { runAddressFeedback: async () => {
+      addressCalls += 1;
+      headSha = 'fixed-head';
+      return { durationMs: 1, result: { commitSha: headSha } };
+    } },
+  });
+  const scanner = new PrScanner({
+    config: workflow.config, store: context.store, gitcode: workflow.gitcode,
+    workflow, feishu: workflow.feishu, identities: workflow.identities,
+  });
+  await workflow.onFeishuMessage(message({ messageId: 'limit-start', text: pr.url }));
+  await workflow.onFeishuMessage(botResult('limit-initial', LISI.botOpenId, 'initial', 0));
+  assert.equal(context.store.getPr(pr.key).headSha, 'fixed-head');
+
+  // Simulate an automatic start already queued behind the last Feishu result.
+  let release;
+  const blocker = new Promise((resolve) => { release = resolve; });
+  const finishingRound = workflow.queue.enqueue(pr.key, async () => {
+    await blocker;
+    await context.store.updatePr(pr.key, (current) => ({
+      ...current, phase: 'failed', stopReason: 'max-review-cycles',
+    }));
+  });
+  const automaticStart = workflow.startAutomaticOwnedReview({
+    pr, headSha, reviewers: context.store.getPr(pr.key).reviewers,
+  });
+  release();
+  await finishingRound;
+  assert.deepEqual(await automaticStart, {
+    started: false, skipped: true, reason: 'max-review-cycles',
+  });
+
+  // Exercise the real round-limit transition, including its persisted reason.
+  await context.store.updatePr(pr.key, (current) => ({
+    ...current, phase: 'awaiting_rereview', stopReason: undefined,
+  }));
+  await workflow.onFeishuMessage(botResult('limit-final', LISI.botOpenId, 'rereview', 1));
+  const stopped = context.store.getPr(pr.key);
+  assert.equal(stopped.phase, 'failed');
+  assert.equal(stopped.stopReason, 'max-review-cycles');
+  assert.ok(context.sent.some((item) => String(item[1]).includes('已达到最大复审轮次')));
+  await context.store.load();
+  headSha = 'later-head';
+  await scanner.scanOnce();
+  await scanner.scanOnce();
+  assert.deepEqual(context.store.getPr(pr.key), JSON.parse(JSON.stringify(stopped)));
+  assert.equal(context.sent.filter(isInitialRequest).length, 1);
+  assert.equal(addressCalls, 1);
+
+  // Only a new explicit user request resets the stopped PR.
+  await workflow.onFeishuMessage(message({ messageId: 'limit-manual-restart', text: pr.url }));
+  assert.equal(context.store.getPr(pr.key).cycle, 0);
+  assert.equal(context.store.getPr(pr.key).stopReason, undefined);
+  assert.equal(context.sent.filter(isInitialRequest).length, 2);
+  await scanner.scanOnce();
+  assert.equal(context.sent.filter(isInitialRequest).length, 2);
 });
 
 test('bot protocol requests are persisted and de-duplicated by PR, sender, mode, and cycle', async (t) => {
