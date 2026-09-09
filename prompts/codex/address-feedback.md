@@ -19,4 +19,4 @@
 7. 不要自行把审查者的 discussion 标记为 resolved；由复审机器人验证后解决。
 8. 最后重新使用插件读取 comments。若插件内容不足以确认状态，可对目标 PR 使用 helper 的只读 `comments` 命令核验。
 9. 任何关键修改、测试、push 或回复失败都返回 blocked。不得输出、记录或把 GITCODE_TOKEN 放进命令行。
-10. 最终严格按照 output schema 返回 JSON，不要添加 Markdown 代码围栏。`action` 为 `address_feedback`；`unresolvedCount` 是等待复审的 discussion 数量。
+10. 最终严格按照 output schema 返回 JSON，不要添加 Markdown 代码围栏。`status` 只能是 `success` 或 `blocked`，成功时必须是 `success`，禁止使用 completed、ok、failed 等其他值；`action` 为 `address_feedback`；`unresolvedCount` 是等待复审的 discussion 数量。

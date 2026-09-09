@@ -24,4 +24,4 @@ GitCode 操作只能使用 `$REVIEW_BOT_HELPER`，它会校验仓库白名单。
    - `node "$REVIEW_BOT_HELPER" resolve "{{PR_URL}}" --discussion-id <id> --confirm-target <owner/repo#number>`
 5. 写操作后重新读取 comments，核对返回的 `path` 和 `diff_position.start_new_line` 是否与预期文件绝对行号一致。若本轮刚创建的评论锚点错误，先补发并验证正确评论，再回复误发 discussion 说明替代关系，然后 resolve 误发 discussion；最终确认只保留有效审查意见为 unresolved。任何鉴权、写入或关键验证失败都返回 blocked，禁止假报成功。
 6. 最终只输出一个合法 JSON 对象，不要 Markdown 代码围栏或额外文字。字段必须完整：
-   `status`、`action`（review）、`prUrl`、`unresolvedCount`、`unresolvedReviewerLogins`、`commentsPosted`、`commentsReplied`、`commentsResolved`、`commitSha`（null）、`summary`、`blockers`。
+   `status`（只能是 `success` 或 `blocked`，成功时必须是 `success`，禁止使用 completed、ok、failed 等其他值）、`action`（review）、`prUrl`、`unresolvedCount`、`unresolvedReviewerLogins`、`commentsPosted`、`commentsReplied`、`commentsResolved`、`commitSha`（null）、`summary`、`blockers`。

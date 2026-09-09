@@ -19,4 +19,4 @@ GitCode 操作只能使用 `$REVIEW_BOT_HELPER`，它会校验仓库白名单。
 6. 不要自行 resolve 审查者的 discussion，由复审机器人确认。最后重新读取 comments 核验。
 7. 任何修改、测试、push 或回复失败都返回 blocked。
 8. 最终只输出一个合法 JSON 对象，不要 Markdown 代码围栏或额外文字。字段必须完整：
-   `status`、`action`（address_feedback）、`prUrl`、`unresolvedCount`、`unresolvedReviewerLogins`、`commentsPosted`、`commentsReplied`、`commentsResolved`（0）、`commitSha`、`summary`、`blockers`。
+   `status`（只能是 `success` 或 `blocked`，成功时必须是 `success`，禁止使用 completed、ok、failed 等其他值）、`action`（address_feedback）、`prUrl`、`unresolvedCount`、`unresolvedReviewerLogins`、`commentsPosted`、`commentsReplied`、`commentsResolved`（0）、`commitSha`、`summary`、`blockers`。

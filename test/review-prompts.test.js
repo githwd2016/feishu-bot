@@ -15,3 +15,12 @@ test('review prompts use GitCode new-file line positions and permit narrow mispo
     assert.doesNotMatch(prompt, /<diff-line-position>|传入正确的 `path`、diff-relative `position`/);
   }
 });
+
+test('all agent prompts enumerate the exact allowed status values', async () => {
+  for (const backend of ['codex', 'opencode']) {
+    for (const template of ['inspect', 'review', 'address-feedback']) {
+      const prompt = await fs.readFile(path.join(projectRoot, 'prompts', backend, `${template}.md`), 'utf8');
+      assert.match(prompt, /`status`[^。]*只能是 `success` 或 `blocked`/, `${backend}/${template}.md 未明确 status 取值`);
+    }
+  }
+});

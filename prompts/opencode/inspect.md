@@ -6,4 +6,4 @@
 
 准确识别需要解决且尚未 resolved 的 review discussions，排除普通 timeline 评论、已解决评论、重复回复和纯信息说明。无法可靠判断时返回 blocked，禁止猜测。
 
-最终只输出一个合法 JSON 对象，不要 Markdown 代码围栏或额外文字。字段必须完整：`status`、`action`（inspect）、`prUrl`、`unresolvedCount`、`unresolvedReviewerLogins`、`commentsPosted`（0）、`commentsReplied`（0）、`commentsResolved`（0）、`commitSha`（null）、`summary`、`blockers`。
+最终只输出一个合法 JSON 对象，不要 Markdown 代码围栏或额外文字。字段必须完整：`status`（只能是 `success` 或 `blocked`，成功时必须是 `success`，禁止使用 completed、ok、failed 等其他值）、`action`（inspect）、`prUrl`、`unresolvedCount`、`unresolvedReviewerLogins`、`commentsPosted`（0）、`commentsReplied`（0）、`commentsResolved`（0）、`commitSha`（null）、`summary`、`blockers`。
