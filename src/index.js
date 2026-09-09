@@ -4,9 +4,10 @@ import { loadConfig, resolveRuntimeIdentities } from './config.js';
 import { StateStore } from './state-store.js';
 import { FeishuGateway } from './feishu.js';
 import { AgentRunner } from './agent-runner.js';
-import { GitCodeClient } from './gitcode-client.js';
+import { createRepositoryClient } from './repository.js';
 import { ReviewWorkflow } from './workflow.js';
 import { PrScanner } from './pr-scanner.js';
+import { createPlatformRouter } from './platform-router.js';
 
 installTimestampedConsole();
 
@@ -15,22 +16,26 @@ async function main() {
   const store = new StateStore(config.stateFile);
   await store.load();
   const feishu = new FeishuGateway(config.feishu);
-  const agent = new AgentRunner(config);
-  const gitcode = new GitCodeClient(config.gitcode);
-  const [botIdentity, gitcodeUser] = await Promise.all([
-    feishu.getBotIdentity(),
-    gitcode.getCurrentUser(),
-  ]);
+  const botIdentity = await feishu.getBotIdentity();
   console.log(`[setup] BOT_OPEN_ID=${botIdentity.openId} BOT_NAME=${botIdentity.name}`);
-  console.log(`[setup] GITCODE_LOGIN=${gitcodeUser.login}`);
-  const identities = resolveRuntimeIdentities(config.identityMappings, { botIdentity, gitcodeUser });
-  console.log(`[setup] IDENTITY_MATCH FEISHU_OPEN_ID=${identities.self.feishuOpenId}`);
-  const workflow = new ReviewWorkflow({ config, store, feishu, agent, gitcode, identities });
-  const scanner = new PrScanner({ config, store, feishu, gitcode, workflow, identities });
+  const workflows = {};
+  const scanners = [];
+  for (const provider of config.repoProviders) {
+    const platformConfig = { ...config, repoProvider: provider };
+    const client = createRepositoryClient(platformConfig);
+    const repositoryUser = await client.getCurrentUser();
+    console.log(`[setup] ${provider.toUpperCase()}_LOGIN=${repositoryUser.login}`);
+    const identities = resolveRuntimeIdentities(config.identityMappings, { botIdentity, repositoryUser, provider });
+    console.log(`[setup] ${provider} IDENTITY_MATCH FEISHU_OPEN_ID=${identities.self.feishuOpenId}`);
+    const agent = new AgentRunner(platformConfig);
+    const workflow = new ReviewWorkflow({ config: platformConfig, store, feishu, agent, client, identities });
+    workflows[provider] = workflow;
+    scanners.push(new PrScanner({ config: platformConfig, store, feishu, client, workflow, identities }));
+  }
 
-  await workflow.recoverInterruptedTasks();
-  feishu.start((event) => workflow.onFeishuMessage(event));
-  scanner.start();
+  for (const workflow of Object.values(workflows)) await workflow.recoverInterruptedTasks();
+  feishu.start(createPlatformRouter({ workflows, store, feishu }));
+  for (const scanner of scanners) scanner.start();
   console.log(`[main] ${config.feishu.botName} 已启动`);
 }
 

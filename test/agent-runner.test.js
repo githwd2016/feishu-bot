@@ -286,3 +286,44 @@ function codexRunner(bin, timeoutMs) {
     },
   });
 }
+test('GitHub tasks select GitHub prompts, helper and credentials for both agent backends', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'github-agent-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const fakeAgent = path.join(directory, 'agent');
+  await fs.writeFile(fakeAgent, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+function finish(prompt) {
+  if (!prompt.includes('https://github.com/org/repo/pull/9') || prompt.includes('{{')) process.exit(2);
+  if (!process.env.REVIEW_BOT_HELPER.endsWith('/scripts/github-api.js')) process.exit(3);
+  if (process.env.GITHUB_TOKEN !== 'gh-test' || process.env.GITCODE_TOKEN || process.env.GH_TOKEN) process.exit(4);
+  if (process.env.GITHUB_ALLOWED_REPOS !== 'org/repo') process.exit(5);
+  if (prompt.includes('gitcode:gitcode') || prompt.includes('--position')) process.exit(6);
+  if (!prompt.includes('"commentsReplied"') || !prompt.includes('"additionalProperties": false')) process.exit(7);
+  const action = prompt.includes('自动处理自己') ? 'address_feedback' : prompt.includes('只读检查') ? 'inspect' : 'review';
+  const result = { status: 'success', action, prUrl: 'https://github.com/org/repo/pull/9',
+    unresolvedCount: 0, unresolvedReviewerLogins: [], commentsPosted: 0, commentsReplied: 0,
+    commentsResolved: 0, commitSha: null, summary: 'ok', blockers: [] };
+  if (args[0] === 'exec') fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], JSON.stringify(result));
+  else process.stdout.write(JSON.stringify({ type: 'text', part: { text: JSON.stringify(result) } }) + '\\n');
+}
+if (args[0] === 'exec') {
+  let prompt = ''; process.stdin.on('data', chunk => prompt += chunk); process.stdin.on('end', () => finish(prompt));
+} else finish(args.at(-1));
+`, { mode: 0o755 });
+  for (const backend of ['codex', 'opencode']) {
+    const runner = new AgentRunner({
+      projectRoot, repoProvider: 'github',
+      gitcode: { token: 'gc-test', allowedRepos: new Set(['org/repo']), workdirs: { 'org/repo': '/wrong-platform' } },
+      github: { token: 'gh-test', apiBase: 'https://api.github.com', allowedRepos: new Set(['org/repo']), workdirs: { 'org/repo': directory } },
+      agent: { backend, timeoutMs: 5000, codex: { bin: fakeAgent }, opencode: { bin: fakeAgent } },
+    }, { worktreeManager: { run: async ({ repository }, callback) => {
+      assert.equal(repository, directory);
+      return callback(directory);
+    } } });
+    const pr = parsePrUrl('https://github.com/org/repo/pull/9');
+    assert.equal((await runner.runReview({ pr, mode: 'initial', reviewerName: 'Bot' })).result.action, 'review');
+    assert.equal((await runner.runAddressFeedback({ pr })).result.action, 'address_feedback');
+    assert.equal((await runner.runInspect({ pr })).result.action, 'inspect');
+  }
+});
