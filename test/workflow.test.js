@@ -17,6 +17,7 @@ import {
 const SELF = { displayName: '张三', feishuOpenId: 'user-zhangsan', gitcodeLogin: 'zhangsan', botOpenId: 'bot-zhangsan' };
 const LISI = { displayName: '李四', feishuOpenId: 'user-lisi', gitcodeLogin: 'lisi', botOpenId: 'bot-lisi' };
 const WANGWU = { displayName: '王五', feishuOpenId: 'user-wangwu', gitcodeLogin: 'wangwu', botOpenId: 'bot-wangwu' };
+const REVIEW_COMPLETION_TEXT = 'review完成 qwren/opsbot#185《docs: 建立开发工作流指南与文档模板体系》：未发现严重问题，仅有 2 处轻微问题（已标注在 PR 代码行）。@何伟栋分身 共 2 处问题待处理，可修复后再次 @王晨阳TARS 评审，或 @王晨阳 决定是否合入：https://gitcode.com/qwren/opsbot/pull/185';
 
 test('owned PR uses GitCode assignees, fixes feedback, and rereviews the original commenter', async (t) => {
   const context = await makeContext(t);
@@ -482,6 +483,7 @@ test('manual review completion skips missing bot results and starts feedback add
 });
 
 test('manual review completion command parser accepts explicit Chinese and English forms', () => {
+  assert.equal(isManualReviewCompletionRequest(REVIEW_COMPLETION_TEXT), true);
   assert.equal(isManualReviewCompletionRequest('确认审查完成'), true);
   assert.equal(isManualReviewCompletionRequest('人工决定本轮复审结束'), true);
   assert.equal(isManualReviewCompletionRequest('review completed, start modifying'), true);
@@ -489,6 +491,36 @@ test('manual review completion command parser accepts explicit Chinese and Engli
   assert.equal(isManualReviewCompletionRequest('确认完成'), true);
   assert.equal(isManualReviewCompletionRequest('收到，正在审查'), false);
 });
+
+for (const senderType of ['user', 'app']) {
+  test(`review完成 summary from ${senderType} starts feedback addressing`, async (t) => {
+    const context = await makeContext(t);
+    let addressCalls = 0;
+    const workflow = makeWorkflow(context, {
+      config: { gitcode: { allowedRepos: new Set(['qwren/opsbot']) } },
+      gitcode: {
+        getPr: async () => prDetails({ author: 'zhangsan', assignees: ['lisi'] }),
+        unresolvedSummary: async () => ({ unresolvedCount: 2, unresolvedReviewerLogins: ['lisi'] }),
+      },
+      agent: {
+        runAddressFeedback: async () => {
+          addressCalls += 1;
+          return { durationMs: 1, result: { commitSha: 'fixed-head' } };
+        },
+      },
+    });
+    await workflow.onFeishuMessage(message({
+      messageId: 'summary-start', text: 'https://gitcode.com/qwren/opsbot/pull/185',
+    }));
+    await workflow.onFeishuMessage(message({
+      messageId: 'summary-result', senderType,
+      senderOpenId: senderType === 'app' ? LISI.botOpenId : LISI.feishuOpenId,
+      text: REVIEW_COMPLETION_TEXT,
+    }));
+    assert.equal(addressCalls, 1);
+    assert.equal(context.store.getPr('qwren/opsbot#185').phase, 'awaiting_rereview');
+  });
+}
 
 test('startup recovery marks interrupted feedback addressing as failed', async (t) => {
   const context = await makeContext(t);
@@ -525,6 +557,9 @@ test('review protocol and third-party result compatibility remain supported', ()
     action: 'result', mode: 'rereview', cycle: 3, status: 'failed',
   });
   assert.equal(parseCompatibleReviewBotResult('已收到，正在审查'), null);
+  assert.deepEqual(parseCompatibleReviewBotResult(REVIEW_COMPLETION_TEXT), { status: 'success' });
+  assert.deepEqual(parseCompatibleReviewBotResult('review完成：发现 2 处问题，已标注在 PR 代码行'), { status: 'success' });
+  assert.equal(parseCompatibleReviewBotResult('正在 review，完成后通知'), null);
   assert.equal(parseCompatibleReviewBotResult('已收到，正在检视'), null);
   assert.deepEqual(parseCompatibleReviewBotResult('审查意见已提交'), { status: 'success' });
   assert.deepEqual(parseCompatibleReviewBotResult('检视意见已提交'), { status: 'success' });

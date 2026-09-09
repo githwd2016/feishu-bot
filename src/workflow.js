@@ -20,7 +20,7 @@ const COMPATIBLE_BOT_SUCCESS_PATTERNS = [
   /(?:审查|复审|检视|评审)(?:意见|评论)?.{0,8}(?:已提交|提交完成|已完成|完成|完毕)/i,
   /已(?:完成|结束)(?:本次)?(?:审查|复审|检视|评审)/i,
   /(?:意见|评论|inline\s+comments?|comments?).{0,8}(?:已提交|提交完成|已发布|发布完成)/i,
-  /(?:review).{0,8}(?:completed|done|finished|submitted)/i,
+  /(?:review).{0,8}(?:completed|done|finished|submitted|已完成|完成|完毕|已提交)/i,
   /(?:comments?).{0,8}(?:submitted|posted|completed)/i,
   /未发现.{0,8}(?:问题|意见|评论)/i,
 ];
@@ -324,7 +324,7 @@ export class ReviewWorkflow {
       await this.#processReviewRound(pr, state);
       return;
     }
-    console.log(`[workflow] 忽略未确认的人工消息 pr=${pr.key}`);
+    console.log(`[workflow] 忽略未确认的人工消息 pr=${pr.key} message=${event.messageId} sender=${event.senderOpenId} senderType=${event.senderType || 'unknown'} phase=${state.phase} reviewerOpenIds=${(state.reviewers || []).map((item) => item.openId).join(',')}`);
   }
 
   async #confirmReviewComplete(pr, event) {
