@@ -358,7 +358,7 @@ export class ReviewWorkflow {
     await this.#sendProgress(state.chatId,
       `已人工确认审查完成${pendingCount ? `（跳过 ${pendingCount} 个未返回结果的 reviewer）` : ''}，正在同步 GitCode comments 状态：${pr.url}`,
       [this.#person(event.senderOpenId, '操作人')]);
-    await this.#processReviewRound(pr, confirmed);
+    await this.#processReviewRound(pr, confirmed, { completionAnnounced: true });
     return { confirmed: true, skippedReviewers: pendingCount };
   }
 
@@ -386,14 +386,16 @@ export class ReviewWorkflow {
     await this.#processReviewRound(pr, state);
   }
 
-  async #processReviewRound(pr, state) {
+  async #processReviewRound(pr, state, { completionAnnounced = false } = {}) {
     if (TERMINAL_PHASES.has(this.store.getPr(pr.key)?.phase)) return;
     const manuallySkipped = (state.manualReviewSkippedReviewers || []).length > 0
       && !Object.values(state.pending || {}).some((status) => status === 'pending');
     const reviewCompletion = manuallySkipped
       ? `已人工确认审查完成（跳过 ${(state.manualReviewSkippedReviewers || []).length} 个未返回结果的 reviewer）`
       : '所有 reviewer 已完成';
-    await this.#sendProgress(state.chatId, `${reviewCompletion}，正在同步 GitCode comments 状态：${pr.url}`);
+    if (!completionAnnounced) {
+      await this.#sendProgress(state.chatId, `${reviewCompletion}，正在同步 GitCode comments 状态：${pr.url}`);
+    }
     const inspection = await this.gitcode.unresolvedSummary(pr);
     if (TERMINAL_PHASES.has(this.store.getPr(pr.key)?.phase)) return;
     console.log(`[workflow] ${pr.key} comments unresolved=${inspection.unresolvedCount} reviewers=${inspection.unresolvedReviewerLogins.join(',') || '-'}`);

@@ -53,6 +53,7 @@ test('owned PR uses GitCode assignees, fixes feedback, and rereviews the origina
   assert.equal(addressCalls, 1);
   const rereview = context.sent.find((item) => String(item[1]).includes('action=request mode=rereview cycle=1'));
   assert.equal(rereview[2][0].openId, LISI.botOpenId);
+  assert.equal(context.sent.filter((item) => /正在同步 GitCode comments 状态/.test(item[1])).length, 1);
 
   unresolved = [];
   await workflow.onFeishuMessage(botResult('lisi-rereview', LISI.botOpenId, 'rereview', 1));
@@ -479,7 +480,10 @@ test('manual review completion skips missing bot results and starts feedback add
   await waitFor(() => context.store.getPr('org/repo#7').phase === 'awaiting_rereview');
   assert.equal(addressCalls, 1);
   assert.deepEqual(context.store.getPr('org/repo#7').manualReviewSkippedReviewers, ['wangwu']);
-  assert.ok(context.sent.some((item) => /跳过 1 个未返回结果的 reviewer/.test(String(item[1]))));
+  const completionMessages = context.sent.filter((item) => /正在同步 GitCode comments 状态/.test(item[1]));
+  assert.equal(completionMessages.length, 1);
+  assert.match(completionMessages[0][1], /已人工确认审查完成（跳过 1 个未返回结果的 reviewer）/);
+  assert.equal(completionMessages[0][2][0].openId, SELF.feishuOpenId);
 });
 
 test('manual review completion command parser accepts explicit Chinese and English forms', () => {
