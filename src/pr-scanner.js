@@ -1,8 +1,9 @@
+import { activeProvider, repositoryConfig, identityLogin, identityByLogin } from './repository.js';
 import {
   assertAllowedPr,
-  gitcodePrMetadata,
-  isGitCodePrWip,
-  prFromGitCodeData,
+  prMetadata,
+  isPrWip,
+  prFromData,
 } from './pr.js';
 import { reviewerFromIdentity } from './workflow.js';
 
@@ -11,10 +12,12 @@ export class PrScanner {
   #timer;
   #blockedWarnings = new Set();
 
-  constructor({ config, store, gitcode, workflow, feishu, identities }) {
+  constructor({ config, store, client, gitcode, workflow, feishu, identities }) {
     this.config = config;
     this.store = store;
-    this.gitcode = gitcode;
+    this.client = client || gitcode;
+    this.provider = activeProvider(config);
+    this.repository = repositoryConfig(config);
     this.workflow = workflow;
     this.feishu = feishu;
     this.identities = identities;
@@ -22,13 +25,13 @@ export class PrScanner {
 
   start() {
     if (!this.config.feishu.autoReviewChatId) {
-      console.warn('[scanner] 未配置 AUTO_REVIEW_CHAT_ID，定时扫描已禁用；可在目标群发送“获取 chat_id”');
+      console.warn(`[scanner:${this.provider}] 未配置 AUTO_REVIEW_CHAT_ID，定时扫描已禁用；可在目标群发送“获取 chat_id”`);
       return;
     }
     void this.scanOnce();
     this.#timer = setInterval(() => void this.scanOnce(), this.config.scan.intervalMs);
     this.#timer.unref();
-    console.log(`[scanner] 已启动，间隔 ${this.config.scan.intervalMs / 1000} 秒`);
+    console.log(`[scanner:${this.provider}] 已启动，间隔 ${this.config.scan.intervalMs / 1000} 秒`);
   }
 
   stop() {
@@ -37,21 +40,21 @@ export class PrScanner {
 
   async scanOnce() {
     if (this.#running) {
-      console.log('[scanner] 上一轮仍在运行，跳过本轮');
+      console.log(`[scanner:${this.provider}] 上一轮仍在运行，跳过本轮`);
       return false;
     }
     if (!this.config.feishu.autoReviewChatId) return false;
     this.#running = true;
     try {
       const [assigned, owned] = await Promise.all([
-        this.gitcode.listUserPulls({ scope: 'need_my_approve', state: 'open' }),
-        this.gitcode.listUserPulls({ scope: 'created_by_me', state: 'open' }),
+        this.client.listUserPulls({ scope: 'need_my_approve', state: 'open' }),
+        this.client.listUserPulls({ scope: 'created_by_me', state: 'open' }),
       ]);
       for (const item of assigned) await this.#processAssigned(item);
       for (const item of owned) await this.#processOwned(item);
       return true;
     } catch (error) {
-      console.error('[scanner] 扫描失败:', error);
+      console.error(`[scanner:${this.provider}] 扫描失败:`, error);
       return false;
     } finally {
       this.#running = false;
@@ -63,10 +66,10 @@ export class PrScanner {
       const loaded = await this.#loadPr(item);
       if (!loaded) return;
       const { pr, metadata } = loaded;
-      if (sameLogin(metadata.authorLogin, this.identities.self.gitcodeLogin)) return;
+      if (sameLogin(metadata.authorLogin, identityLogin(this.identities.self))) return;
       const headSha = requiredHeadSha(metadata, pr);
-      const key = `assigned-review|${pr.key}|${headSha}|${this.identities.self.gitcodeLogin.toLowerCase()}`;
-      const authorIdentity = this.identities.byGitcodeLogin(metadata.authorLogin);
+      const key = `assigned-review|${pr.key}|${headSha}|${identityLogin(this.identities.self).toLowerCase()}`;
+      const authorIdentity = identityByLogin(this.identities, metadata.authorLogin);
       await this.#runTask(key, {
         pr,
         headSha,
@@ -84,7 +87,7 @@ export class PrScanner {
         }),
       });
     } catch (error) {
-      console.error('[scanner] 处理待审 PR 失败:', error);
+      console.error(`[scanner:${this.provider}] 处理待审 PR 失败:`, error);
     }
   }
 
@@ -92,15 +95,20 @@ export class PrScanner {
     try {
       const loaded = await this.#loadPr(item);
       if (!loaded) return;
-      const { pr, metadata } = loaded;
-      if (!sameLogin(metadata.authorLogin, this.identities.self.gitcodeLogin)) return;
+      const { pr, metadata, details } = loaded;
+      if (!sameLogin(metadata.authorLogin, identityLogin(this.identities.self))) return;
       if (this.store.automaticOwnedReviewBlockReason(pr.key, {
         headSha: metadata.headSha,
         maxReviewCycles: this.config.maxReviewCycles,
       })) return;
 
+      if (this.provider === 'github' && details.requested_teams?.length) {
+        await this.#warnBlocked(`team-reviewer|${pr.key}|${metadata.headSha}`,
+          `GitHub 团队审查请求暂不支持自动分发，请在 PR Reviewers 中指定个人：${pr.url}`);
+        return;
+      }
       const reviewerLogins = metadata.assigneeLogins.filter(
-        (login) => !sameLogin(login, this.identities.self.gitcodeLogin),
+        (login) => !sameLogin(login, identityLogin(this.identities.self)),
       );
       if (reviewerLogins.length === 0) {
         await this.#warnBlocked(`no-reviewer|${pr.key}|${metadata.headSha}`,
@@ -108,16 +116,16 @@ export class PrScanner {
         return;
       }
 
-      const missing = reviewerLogins.filter((login) => !this.identities.byGitcodeLogin(login));
+      const missing = reviewerLogins.filter((login) => !identityByLogin(this.identities, login));
       if (missing.length > 0) {
         await this.#warnBlocked(`missing-reviewer|${pr.key}|${metadata.headSha}|${missing.sort().join(',')}`,
-          `以下 GitCode 审查人缺少三方映射，未执行部分分发：${missing.join(', ')} ${pr.url}`);
+          `以下审查人缺少三方映射，未执行部分分发：${missing.join(', ')} ${pr.url}`);
         return;
       }
 
       const headSha = requiredHeadSha(metadata, pr);
       const candidates = reviewerLogins.map((login) => {
-        const identity = this.identities.byGitcodeLogin(login);
+        const identity = identityByLogin(this.identities, login);
         return {
           key: `owned-dispatch|${pr.key}|${headSha}|${login.toLowerCase()}`,
           reviewer: reviewerFromIdentity(identity),
@@ -147,25 +155,25 @@ export class PrScanner {
         }
       }
     } catch (error) {
-      console.error('[scanner] 处理本人 PR 失败:', error);
+      console.error(`[scanner:${this.provider}] 处理本人 PR 失败:`, error);
     }
   }
 
   async #loadPr(item) {
-    const pr = prFromGitCodeData(item);
-    if (!pr) throw new Error('GitCode PR 列表项缺少可识别的仓库或 PR 编号');
-    if (this.config.gitcode.allowedRepos.size > 0 && !this.config.gitcode.allowedRepos.has(pr.repoKey)) return null;
-    assertAllowedPr(pr, this.config.gitcode.allowedRepos);
-    if (isGitCodePrWip(item)) {
-      console.log(`[scanner] 跳过 WIP PR: ${pr.url}`);
+    const pr = prFromData(item, this.provider);
+    if (!pr) throw new Error('PR 列表项缺少可识别的仓库或 PR 编号');
+    if (this.repository.allowedRepos.size > 0 && !this.repository.allowedRepos.has(pr.repoKey)) return null;
+    assertAllowedPr(pr, this.repository.allowedRepos, this.provider);
+    if (isPrWip(item)) {
+      console.log(`[scanner:${this.provider}] 跳过 WIP PR: ${pr.url}`);
       return null;
     }
-    const details = await this.gitcode.getPr(pr);
-    if (isGitCodePrWip(details)) {
-      console.log(`[scanner] 跳过 WIP PR: ${pr.url}`);
+    const details = await this.client.getPr(pr);
+    if (isPrWip(details)) {
+      console.log(`[scanner:${this.provider}] 跳过 WIP PR: ${pr.url}`);
       return null;
     }
-    return { pr, details, metadata: gitcodePrMetadata(details) };
+    return { pr, details, metadata: prMetadata(details, this.provider) };
   }
 
   async #runTask(key, { pr, headSha, responsibility, notificationTarget, task }) {
@@ -194,7 +202,7 @@ export class PrScanner {
     const state = await this.store.failAutomationTask(key, error, {
       maxAttempts: this.config.scan.maxAttempts,
     });
-    console.error(`[scanner] 自动任务失败 key=${key} attempt=${state.attempts}:`, error);
+    console.error(`[scanner:${this.provider}] 自动任务失败 key=${key} attempt=${state.attempts}:`, error);
     const attempt = `commit ${shortSha(headSha)}，第 ${state.attempts}/${this.config.scan.maxAttempts} 次尝试`;
     const outcome = state.status === 'exhausted'
       ? '已停止重试'
@@ -230,7 +238,7 @@ function sameLogin(left, right) {
 }
 
 function requiredHeadSha(metadata, pr) {
-  if (!metadata.headSha) throw new Error(`GitCode PR 未返回 head SHA: ${pr.url}`);
+  if (!metadata.headSha) throw new Error(`PR 未返回 head SHA: ${pr.url}`);
   return metadata.headSha;
 }
 
