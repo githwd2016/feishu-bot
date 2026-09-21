@@ -25,6 +25,21 @@ test('loadConfig selects Codex by default and configures scanning', () => {
   assert.equal(opencode.agent.opencode.autoApprove, true);
 });
 
+test('loadConfig supports Claude without bypassing permissions by default', () => {
+  const config = loadConfig({ ...baseEnv, AGENT_BACKEND: ' Claude ' });
+  assert.equal(config.agent.backend, 'claude');
+  assert.deepEqual(config.agent.claude, {
+    bin: 'claude', model: '', permissionMode: '', dangerouslySkipPermissions: false,
+  });
+  const custom = loadConfig({ ...baseEnv, AGENT_BACKEND: 'claude', CLAUDE_BIN: '/custom/claude',
+    CLAUDE_MODEL: 'sonnet', CLAUDE_PERMISSION_MODE: 'acceptEdits', CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS: 'true' });
+  assert.deepEqual(custom.agent.claude, {
+    bin: '/custom/claude', model: 'sonnet', permissionMode: 'acceptEdits', dangerouslySkipPermissions: true,
+  });
+  assert.equal(loadConfig({ ...baseEnv, CLAUDE_AUTO_APPROVE: 'true' }).agent.claude.dangerouslySkipPermissions, true);
+  assert.throws(() => loadConfig({ ...baseEnv, AGENT_BACKEND: 'unknown' }), /AGENT_BACKEND/);
+});
+
 test('loadConfig validates identity mappings and rejects obsolete owner/reviewer config', () => {
   assert.throws(() => loadConfig({ ...baseEnv, IDENTITY_MAPPINGS_JSON: '[]' }), /至少需要配置一个用户/);
   assert.throws(() => loadConfig({

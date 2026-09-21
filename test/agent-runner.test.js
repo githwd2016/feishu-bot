@@ -13,6 +13,8 @@ import {
   parseOpenCodeResult,
   summarizeCodexEvent,
   summarizeOpenCodeEvent,
+  parseClaudeCompletion,
+  summarizeClaudeEvent,
 } from '../src/agent-runner.js';
 import { parsePrUrl } from '../src/pr.js';
 import { PROGRESS_HEARTBEAT_MS } from '../src/progress.js';
@@ -256,6 +258,17 @@ test('parseOpenCodeResult accepts fenced JSON text events', () => {
     part: { text: '```json\\n{"status":"success","prUrl":"x"}\\n```' },
   }));
   assert.equal(result.status, 'success');
+});
+
+test('Claude completion parsing accepts schema JSON and stream events', () => {
+  const structured = { status: 'success', action: 'inspect', prUrl: 'https://gitcode.com/org/repo/pull/9' };
+  const json = JSON.stringify({ session_id: 'claude-json', result: JSON.stringify(structured), structured_output: structured });
+  assert.deepEqual(parseClaudeCompletion(json).structured_output, structured);
+  assert.equal(parseClaudeCompletion(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'claude-stream' })
+    + '\n' + JSON.stringify({ type: 'result', subtype: 'success', result: 'ok', session_id: 'claude-stream' })).result, 'ok');
+  assert.equal(summarizeClaudeEvent({ type: 'system', subtype: 'init' }), '模型开始处理');
+  assert.equal(summarizeClaudeEvent({ type: 'result', subtype: 'success' }), '模型处理完成，正在校验结果');
+  assert.throws(() => parseClaudeCompletion(JSON.stringify({ type: 'result', subtype: 'error', is_error: true })), /claude 模型报告执行失败/);
 });
 
 test('OpenCode export fallback finds the last structured assistant text', () => {
