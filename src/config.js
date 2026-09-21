@@ -108,8 +108,8 @@ function assertUnique(items, field, caseInsensitive) {
 
 export function loadConfig(env = process.env) {
   const agentBackend = (env.AGENT_BACKEND || 'codex').trim().toLowerCase();
-  if (!['codex', 'opencode'].includes(agentBackend)) {
-    throw new Error('AGENT_BACKEND 必须是 codex 或 opencode');
+  if (!['codex', 'opencode', 'claude'].includes(agentBackend)) {
+    throw new Error('AGENT_BACKEND 必须是 codex、opencode 或 claude');
   }
   const repoProviders = [...new Set((env.REPO_PROVIDERS || 'gitcode').split(',').map((value) => value.trim().toLowerCase()).filter(Boolean))];
   if (!repoProviders.length || repoProviders.some((provider) => !['gitcode', 'github'].includes(provider))) {
@@ -188,6 +188,13 @@ export function loadConfig(env = process.env) {
         agent: env.OPENCODE_AGENT || '',
         variant: env.OPENCODE_VARIANT || '',
         autoApprove: env.OPENCODE_AUTO_APPROVE === 'true',
+      },
+      claude: {
+        bin: env.CLAUDE_BIN || 'claude',
+        model: env.CLAUDE_MODEL || '',
+        permissionMode: env.CLAUDE_PERMISSION_MODE || '',
+        dangerouslySkipPermissions: env.CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS === 'true'
+          || env.CLAUDE_AUTO_APPROVE === 'true',
       },
     },
     maxReviewCycles: integer(env, 'MAX_REVIEW_CYCLES', 3),

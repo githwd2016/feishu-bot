@@ -56,7 +56,9 @@ export class AgentRunner {
     const env = this.#environment(false);
     const output = this.config.agent.backend === 'codex'
       ? await this.#runCodexText({ prompt, workdir, env })
-      : await this.#runOpenCodeText({ prompt, workdir, env });
+      : this.config.agent.backend === 'claude'
+        ? await this.#runClaude({ prompt, workdir, env })
+        : await this.#runOpenCodeText({ prompt, workdir, env });
     const text = String(output.text || '').trim();
     if (!text) throw new Error(`${this.config.agent.backend} 未返回周报正文`);
     return { text, sessionId: output.sessionId || null, durationMs: Date.now() - startedAt };
@@ -157,8 +159,10 @@ export class AgentRunner {
     const backend = this.config.agent.backend;
     const taskName = template.replace(/\.md$/, '');
     const startedAt = Date.now();
-    const promptPath = path.join(this.config.projectRoot, 'prompts', this.provider === 'github' ? 'github' : backend, template);
+    const promptBackend = backend === 'claude' ? 'opencode' : backend;
+    const promptPath = path.join(this.config.projectRoot, 'prompts', this.provider === 'github' ? 'github' : promptBackend, template);
     let prompt = await fs.readFile(promptPath, 'utf8');
+    if (backend === 'claude') prompt = prompt.replaceAll('OpenCode', 'Claude Code');
     for (const [key, value] of Object.entries({ ...replacements, PR_KEY: pr.key })) {
       prompt = prompt.replaceAll(`{{${key}}}`, String(value));
     }
@@ -178,7 +182,9 @@ export class AgentRunner {
     try {
       const output = backend === 'codex'
         ? await this.#runCodex({ pr, prompt, workdir, env, signal })
-        : await this.#runOpenCode({ pr, prompt, workdir, env, signal });
+        : backend === 'claude'
+          ? await this.#runClaude({ pr, prompt, workdir, env, signal })
+          : await this.#runOpenCode({ pr, prompt, workdir, env, signal });
       validateAgentResult(output.result, pr);
       if (output.result.status !== 'success') {
         throw new Error(`${backend} 任务被阻塞: ${output.result.blockers.join('; ') || output.result.summary}`);
@@ -272,6 +278,42 @@ export class AgentRunner {
     } finally {
       progress.flush();
       await fs.rm(tempDirectory, { recursive: true, force: true });
+    }
+  }
+
+  async #runClaude({ pr, prompt, workdir, env, signal }) {
+    const settings = this.config.agent.claude;
+    // JSON mode is required for schema-backed review results. Weekly reports
+    // use stream-json so long-running work still emits progress events.
+    const args = ['-p', '--output-format', pr ? 'json' : 'stream-json'];
+    if (!pr) args.push('--verbose');
+    if (settings.model) args.push('--model', settings.model);
+    if (settings.dangerouslySkipPermissions) args.push('--dangerously-skip-permissions');
+    else if (settings.permissionMode) args.push('--permission-mode', settings.permissionMode);
+    if (pr) {
+      const schema = await fs.readFile(path.join(this.config.projectRoot, 'schemas', 'agent-result.schema.json'), 'utf8');
+      args.push('--json-schema', schema);
+    }
+    const progress = createJsonEventProgress({
+      prefix: `[agent:claude:${pr?.key || 'weekly-report'}]`,
+      summarize: summarizeClaudeEvent,
+      terminalFailure: claudeTerminalFailure,
+    });
+    try {
+      const logs = await runProcess({
+        bin: settings.bin, args, cwd: workdir, env, stdin: prompt,
+        timeoutMs: this.config.agent.timeoutMs, signal, onStdout: progress.write,
+      });
+      progress.flush();
+      const event = parseClaudeCompletion(logs.stdout);
+      if (pr) {
+        const result = event.structured_output || parseJsonObject(event.result);
+        if (!result || typeof result !== 'object') throw new Error('claude 未返回符合 schema 的最终结果');
+        return { ...logs, sessionId: progress.sessionId || event.session_id, result };
+      }
+      return { ...logs, sessionId: progress.sessionId || event.session_id, text: typeof event.result === 'string' ? event.result : '' };
+    } finally {
+      progress.flush();
     }
   }
 
@@ -498,6 +540,7 @@ function codexTerminalFailure(event) {
 
 function extractAgentSessionId(event) {
   for (const value of [
+    event?.session_id,
     event?.thread_id,
     event?.sessionID,
     event?.sessionId,
@@ -537,6 +580,35 @@ export function summarizeOpenCodeEvent(event) {
   if (type.includes('tool')) return '正在调用工具';
   if (type.includes('error') || type.includes('failed')) return '模型报告执行失败';
   return null;
+}
+
+function claudeTerminalFailure(event) {
+  const isResult = event?.type === 'result' || (!event?.type && (event?.result !== undefined || event?.structured_output));
+  return isResult && (event.is_error || event.subtype === 'error' || event.subtype === 'failed')
+    ? 'claude 模型报告执行失败' : null;
+}
+
+export function summarizeClaudeEvent(event) {
+  if (event?.type === 'system' && event.subtype === 'init') return '模型开始处理';
+  if (event?.type === 'result') return claudeTerminalFailure(event)
+    ? '模型报告执行失败' : '模型处理完成，正在校验结果';
+  if (event?.type === 'assistant' && event.message?.content?.some((part) => part.type === 'tool_use')) {
+    return '正在调用工具';
+  }
+  return null;
+}
+
+export function parseClaudeCompletion(stdout) {
+  let result;
+  for (const line of stdout.split(/\r?\n/)) {
+    try {
+      const event = JSON.parse(line);
+      if (event?.type === 'result' || (!event?.type && (event?.result !== undefined || event?.structured_output))) result = event;
+    } catch {}
+  }
+  if (!result) throw new Error('claude 已结束但未生成最终结果');
+  if (claudeTerminalFailure(result)) throw new Error('claude 模型报告执行失败');
+  return result;
 }
 
 function formatDuration(durationMs) {

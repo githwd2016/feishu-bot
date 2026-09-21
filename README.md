@@ -11,13 +11,13 @@ GitCode 扫描规则：
 - 审查意见产生后，PR 作者的机器人会自动修改、测试、提交、回复并请求原审查人复审；
 - 全部意见解决后只通知可以合入，不自动执行评审通过或合并。
 
-支持 Codex 和 OpenCode 两种 agent 后端。GitCode 的 Codex 任务使用已安装插件；GitHub 任务在两种后端中都使用项目内的 GitHub helper。GitHub 根据个人 Reviewers 请求发现待审 PR，不能把 Assignees 当作审查人。
+支持 Codex、OpenCode 和 Claude Code 三种 agent 后端。GitCode 的 Codex 任务使用已安装插件，OpenCode/Claude Code 使用项目内的 GitCode helper；GitHub 任务在三种后端中都使用项目内的 GitHub helper。GitHub 根据个人 Reviewers 请求发现待审 PR，不能把 Assignees 当作审查人。
 
 ## 运行要求
 
 - Node.js 20+
 - 每个启用平台对应的个人 Personal Access Token
-- Codex CLI（处理 GitCode 时启用 GitCode 插件）或 OpenCode CLI
+- Codex CLI（处理 GitCode 时启用 GitCode 插件）、OpenCode CLI 或 Claude Code CLI
 - 需要自动修改的仓库本地 checkout
 - 能长期运行 Node 服务的主机
 
@@ -151,6 +151,22 @@ OPENCODE_AGENT=
 OPENCODE_VARIANT=high
 OPENCODE_AUTO_APPROVE=true
 ```
+
+Claude Code：
+
+```dotenv
+AGENT_BACKEND=claude
+CLAUDE_BIN=claude
+CLAUDE_MODEL=
+CLAUDE_PERMISSION_MODE=
+CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS=false
+```
+
+先以运行服务的系统用户完成 Claude Code 登录，或配置其支持的 `ANTHROPIC_API_KEY` 等认证环境变量。模型留空使用 CLI 默认模型，也可填 `sonnet`、`opus` 或完整模型 ID。需要支持 `--json-schema` 和 `--output-format stream-json` 的 Claude Code 版本。
+
+Claude Code 支持审查、复审、反馈修改、状态检查和周报；沿用临时 worktree、超时和取消机制。GitCode 共用 `prompts/opencode/` 中的 helper 提示词，运行时替换后端名称；GitHub 共用 `prompts/github/`。审查结果使用 schema 约束的 `structured_output`，失败或缺失最终结果会报错。
+
+权限模式留空使用 CLI 自身配置；后台运行前须配置允许执行所需 helper、Git 和测试命令的权限。`CLAUDE_PERMISSION_MODE` 可指定 CLI 支持的模式，例如 `acceptEdits`（它不会自动批准所有命令）。在已隔离的无人值守环境中可显式设置 `CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS=true`，此时忽略权限模式；`CLAUDE_AUTO_APPROVE=true` 为同义配置。默认不会跳过权限检查。参数说明见 [Claude Code 非交互运行文档](https://code.claude.com/docs/en/headless)。
 
 放宽审批或沙箱限制只应在专用、外部已隔离的运行环境中使用。
 
@@ -287,17 +303,17 @@ GitCode created_by_me
 3. `IDENTITY_MAPPINGS_JSON` 中用户、GitCode login 和 bot open_id 无误；
 4. `GITCODE_TOKEN` 属于当前 bot 映射的 GitCode 用户；
 5. GitCode 仓库位于白名单，本地仓库和 push 凭据可用；
-6. Codex 部署已启用 GitCode 插件，或 OpenCode helper 鉴权正常。
+6. Codex 部署已启用 GitCode 插件，或 OpenCode/Claude Code helper 鉴权正常。
 
 ## 项目结构
 
 ```text
 src/                    飞书、扫描器、状态机和 agent runner
 prompts/codex/          Codex 任务提示
-prompts/opencode/       OpenCode 任务提示
+prompts/opencode/       OpenCode/Claude Code 共用的 GitCode 任务提示
 scripts/gitcode-api.js  GitCode 白名单 helper
 scripts/github-api.js   GitHub 白名单 helper
-prompts/github/        两种 agent 共用的 GitHub 任务提示
+prompts/github/        三种 agent 共用的 GitHub 任务提示
 schemas/                agent 结构化结果定义
 test/                   单元与流程测试
 ```
