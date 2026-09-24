@@ -709,7 +709,11 @@ export function isManualReviewCompletionRequest(text = '') {
     || /(?:审查|复审|检视|评审|review)\s*(?:已|已经|is\s*)?(?:完成|结束|完毕|complete|completed|done|finished)\s*(?:[，,:：\s]*(?:确认|开始修改|继续|start\s+modifying))/i.test(value)
     || /(?:confirm|approve)\s+(?:the\s+)?(?:review|re-?review)\s+(?:is\s+)?(?:complete|completed|done|finished)/i.test(value)
     || /(?:^|[\s，,:：])(?:人工|手动|手工)?\s*(?:确认|确定)\s*(?:完成|结束|完毕)(?:$|[\s，,:：])/i.test(value)
-    || /(?:^|[\s，,:：])(?:审查|复审|检视|评审|review)\s*(?:已|已经|is\s*)?(?:完成|结束|完毕|complete|completed|done|finished)(?:$|[\s，,:：])/i.test(value);
+    || /(?:^|[\s，,:：])(?:审查|复审|检视|评审|review)\s*(?:已|已经|is\s*)?(?:完成|结束|完毕|complete|completed|done|finished)(?:$|[\s，,:：])/i.test(value)
+    // “手动推进”是给群里使用的短命令；只在已有等待中的 PR 任务时生效。
+    || /(?:人工|手动|手工)\s*(?:推进|继续|开始修改|进入修改)/i.test(value)
+    || /(?:确认|同意)\s*(?:继续推进|开始修改|继续修改)/i.test(value)
+    || /(?:proceed|continue)\s+(?:manually|with\s+(?:the\s+)?changes?)/i.test(value);
 }
 
 function isCancellationError(error) {

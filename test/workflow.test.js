@@ -474,7 +474,7 @@ test('manual review completion skips missing bot results and starts feedback add
   assert.equal(context.store.getPr('org/repo#7').phase, 'awaiting_review');
   await workflow.onFeishuMessage(message({
     messageId: 'manual-review-confirm', senderOpenId: SELF.feishuOpenId,
-    text: '确认审查完成：https://gitcode.com/org/repo/pull/7',
+    text: '手动推进：https://gitcode.com/org/repo/pull/7',
   }));
 
   await waitFor(() => context.store.getPr('org/repo#7').phase === 'awaiting_rereview');
@@ -493,6 +493,9 @@ test('manual review completion command parser accepts explicit Chinese and Engli
   assert.equal(isManualReviewCompletionRequest('review completed, start modifying'), true);
   assert.equal(isManualReviewCompletionRequest('审查完成'), true);
   assert.equal(isManualReviewCompletionRequest('确认完成'), true);
+  assert.equal(isManualReviewCompletionRequest('手动推进'), true);
+  assert.equal(isManualReviewCompletionRequest('人工继续修改'), true);
+  assert.equal(isManualReviewCompletionRequest('proceed manually'), true);
   assert.equal(isManualReviewCompletionRequest('收到，正在审查'), false);
 });
 

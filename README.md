@@ -231,7 +231,13 @@ GitCode created_by_me
 确认审查完成 https://gitcode.com/example-org/example-repo/pull/123
 ```
 
-也支持“人工决定本轮复审结束”等同义说法。普通消息不会触发修改；人工确认只对正在等待 reviewer 结果的审查任务生效。
+也可以使用短命令：
+
+```text
+手动推进 https://gitcode.com/example-org/example-repo/pull/123
+```
+
+也支持“人工决定本轮复审结束”等同义说法。普通消息不会触发修改；手动推进只对正在等待 reviewer 结果的审查任务生效。
 
 ### 取消任务
 
