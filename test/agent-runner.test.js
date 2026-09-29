@@ -100,7 +100,15 @@ test('AgentRunner supports the OpenCode JSON event backend', async (t) => {
   await fs.writeFile(fakeOpenCode, `#!/usr/bin/env node
 const args = process.argv.slice(2);
 const prompt = args[args.length - 1];
-if (!args.includes('run') || !args.includes('--format') || !prompt.includes('https://gitcode.com/org/repo/pull/9')) process.exit(2);
+if (!args.includes('run') || args[args.indexOf('--format') + 1] !== 'json') process.exit(2);
+if (args.includes('--dir') || args.includes('--variant')) process.exit(3);
+if (args[args.indexOf('--model') + 1] !== 'provider/model#high') process.exit(4);
+if (args[args.indexOf('--agent') + 1] !== 'reviewer' || !args.includes('--auto')) process.exit(5);
+if (process.cwd() !== ${JSON.stringify(projectRoot)}) process.exit(6);
+if (!prompt.includes('https://gitcode.com/org/repo/pull/9')) {
+  process.stdout.write(JSON.stringify({ type: 'text', part: { type: 'text', text: 'weekly report' } }) + '\\n');
+  process.exit(0);
+}
 const result = {
   status: 'success', action: 'review', prUrl: 'https://gitcode.com/org/repo/pull/9',
   unresolvedCount: 2, unresolvedReviewerLogins: ['reviewer'], commentsPosted: 2,
@@ -118,7 +126,7 @@ process.stdout.write(JSON.stringify({ type: 'text', part: { type: 'text', text: 
     agent: {
       backend: 'opencode', timeoutMs: 5000,
       codex: { bin: 'codex', model: '', profile: '', bypassApprovalsAndSandbox: false },
-      opencode: { bin: fakeOpenCode, model: '', agent: '', variant: '', autoApprove: true },
+      opencode: { bin: fakeOpenCode, model: 'provider/model', agent: 'reviewer', variant: 'high', autoApprove: true },
     },
   });
   const output = await runner.runReview({
@@ -126,6 +134,7 @@ process.stdout.write(JSON.stringify({ type: 'text', part: { type: 'text', text: 
   });
   assert.equal(output.result.unresolvedCount, 2);
   assert.equal(output.sessionId, 'opencode-session-test');
+  assert.equal((await runner.runWeeklySummary({ prompt: 'Summarize this week' })).text, 'weekly report');
 });
 
 test('AgentRunner reports a missing Codex final result without exposing a temporary path', async (t) => {

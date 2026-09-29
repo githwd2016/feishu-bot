@@ -170,6 +170,18 @@ Claude Code 支持审查、复审、反馈修改、状态检查和周报；沿�
 
 放宽审批或沙箱限制只应在专用、外部已隔离的运行环境中使用。
 
+失败会话仍会保留在对应 CLI 的会话历史中。日志中的 `session=...` 可用于进入完整对话：
+
+```bash
+# Codex
+codex resume <session-id>
+
+# Claude Code
+claude --resume <session-id>
+```
+
+终态失败会等待 CLI 自然退出后再报告，避免在会话写入完成前终止进程。超时或手动取消仍会终止进程，可能只保留已写入的部分历史。
+
 ## 启动
 
 ```bash

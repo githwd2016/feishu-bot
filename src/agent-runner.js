@@ -86,6 +86,9 @@ export class AgentRunner {
       await runProcess({
         bin: settings.bin, args, cwd: workdir, env, stdin: prompt,
         timeoutMs: this.config.agent.timeoutMs, onStdout: progress.write,
+        // Let Codex finish writing its persistent rollout after a terminal
+        // failure so `codex resume <session>` can open the full history.
+        stopOnTerminalError: false,
       });
       const text = await fs.readFile(outputPath, 'utf8').catch((error) => {
         if (error.code === 'ENOENT') throw new Error('codex 已结束但未生成周报正文');
@@ -100,11 +103,7 @@ export class AgentRunner {
 
   async #runOpenCodeText({ prompt, workdir, env }) {
     const settings = this.config.agent.opencode;
-    const args = ['run', '--format', 'json', '--dir', workdir];
-    if (settings.model) args.push('--model', settings.model);
-    if (settings.agent) args.push('--agent', settings.agent);
-    if (settings.variant) args.push('--variant', settings.variant);
-    if (settings.autoApprove) args.push('--auto');
+    const args = openCodeRunArgs(settings);
     args.push(prompt);
     const progress = createJsonEventProgress({
       prefix: '[agent:opencode:weekly-report]', summarize: summarizeOpenCodeEvent,
@@ -179,15 +178,17 @@ export class AgentRunner {
     }, PROGRESS_HEARTBEAT_MS);
     heartbeat.unref();
 
+    let output;
     try {
-      const output = backend === 'codex'
+      output = backend === 'codex'
         ? await this.#runCodex({ pr, prompt, workdir, env, signal })
         : backend === 'claude'
           ? await this.#runClaude({ pr, prompt, workdir, env, signal })
           : await this.#runOpenCode({ pr, prompt, workdir, env, signal });
       validateAgentResult(output.result, pr);
       if (output.result.status !== 'success') {
-        throw new Error(`${backend} 任务被阻塞: ${output.result.blockers.join('; ') || output.result.summary}`);
+        const session = output.sessionId ? `（session ${output.sessionId}）` : '';
+        throw new Error(`${backend} 任务被阻塞: ${output.result.blockers.join('; ') || output.result.summary}${session}`);
       }
       const durationMs = Date.now() - startedAt;
       const session = output.sessionId ? ` session=${output.sessionId}` : '';
@@ -198,6 +199,9 @@ export class AgentRunner {
         + ` resolved=${output.result.commentsResolved}`);
       return { ...output, durationMs };
     } catch (error) {
+      if (output?.sessionId && !String(error.message || '').includes(`session ${output.sessionId}`)) {
+        error.message = `${error.message}（session ${output.sessionId}）`;
+      }
       const durationMs = Date.now() - startedAt;
       console.error(`[agent:${backend}] 失败 ${taskName} ${pr.key} elapsed=${formatDuration(durationMs)} error=${oneLine(error.message)}`);
       throw error;
@@ -255,6 +259,8 @@ export class AgentRunner {
         timeoutMs: this.config.agent.timeoutMs,
         signal,
         onStdout: progress.write,
+        // Do not SIGTERM a failed turn before Codex persists its rollout.
+        stopOnTerminalError: false,
       });
       let resultText;
       try {
@@ -303,6 +309,10 @@ export class AgentRunner {
       const logs = await runProcess({
         bin: settings.bin, args, cwd: workdir, env, stdin: prompt,
         timeoutMs: this.config.agent.timeoutMs, signal, onStdout: progress.write,
+        // Claude emits the terminal result before it finishes persisting the
+        // session. Sending SIGTERM from the stdout callback can leave the
+        // reported session absent from Claude's history.
+        stopOnTerminalError: false,
       });
       progress.flush();
       const event = parseClaudeCompletion(logs.stdout);
@@ -319,11 +329,7 @@ export class AgentRunner {
 
   async #runOpenCode({ pr, prompt, workdir, env, signal }) {
     const settings = this.config.agent.opencode;
-    const args = ['run', '--format', 'json', '--dir', workdir];
-    if (settings.model) args.push('--model', settings.model);
-    if (settings.agent) args.push('--agent', settings.agent);
-    if (settings.variant) args.push('--variant', settings.variant);
-    if (settings.autoApprove) args.push('--auto');
+    const args = openCodeRunArgs(settings);
     args.push(prompt);
     const progress = createJsonEventProgress({
       prefix: `[agent:opencode:${pr.key}]`,
@@ -361,7 +367,23 @@ export class AgentRunner {
   }
 }
 
-function runProcess({ bin, args, cwd, env, stdin, timeoutMs, onStdout, onStderr, signal }) {
+function openCodeRunArgs(settings) {
+  const args = ['run', '--format', 'json'];
+  if (settings.variant && !settings.model) {
+    throw new Error('OPENCODE_VARIANT 需要同时配置 OPENCODE_MODEL');
+  }
+  if (settings.model) {
+    args.push('--model', settings.variant ? `${settings.model}#${settings.variant}` : settings.model);
+  }
+  if (settings.agent) args.push('--agent', settings.agent);
+  if (settings.autoApprove) args.push('--auto');
+  return args;
+}
+
+function runProcess({
+  bin, args, cwd, env, stdin, timeoutMs, onStdout, onStderr, signal,
+  stopOnTerminalError = true, terminalErrorGraceMs = 30_000,
+}) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(cancellationError());
@@ -409,6 +431,19 @@ function runProcess({ bin, args, cwd, env, stdin, timeoutMs, onStdout, onStderr,
     const stopForTerminalError = (error) => {
       if (!(error instanceof Error) || terminalError || timedOut || settled) return;
       terminalError = error;
+      if (!stopOnTerminalError) {
+        // Give the CLI time to flush its persistent session, then clean up a
+        // process that failed to exit on its own.
+        forceKillTimer = setTimeout(() => {
+          if (settled) return;
+          console.error(`[agent:process] ${path.basename(bin)} 终态失败后未退出，正在终止进程组`);
+          terminateProcessTree(child, 'SIGTERM');
+          forceKillTimer = setTimeout(() => terminateProcessTree(child, 'SIGKILL'), 10_000);
+          forceKillTimer.unref();
+        }, terminalErrorGraceMs);
+        forceKillTimer.unref();
+        return;
+      }
       console.error(`[agent:process] ${path.basename(bin)} 报告终态失败，正在终止进程组`);
       terminateProcessTree(child, 'SIGTERM');
       forceKillTimer = setTimeout(() => terminateProcessTree(child, 'SIGKILL'), 10_000);
@@ -490,6 +525,7 @@ function createJsonEventProgress({ prefix, summarize, terminalFailure }) {
   let pending = '';
   let sessionId = null;
   let terminalError = null;
+  let lastErrorDetail = '';
   const emitted = new Set();
   const consume = (line) => {
     if (!line.trim()) return;
@@ -502,13 +538,18 @@ function createJsonEventProgress({ prefix, summarize, terminalFailure }) {
     const discoveredSessionId = extractAgentSessionId(event);
     if (!sessionId && discoveredSessionId) {
       sessionId = discoveredSessionId;
-      console.log(`${prefix} 会话已保存 session=${sessionId}`);
+      console.log(`${prefix} 会话已识别 session=${sessionId}`);
+    }
+    const eventError = eventErrorDetail(event);
+    if (eventError && (event.type === 'error' || event.type === 'turn.failed')) {
+      lastErrorDetail = eventError;
     }
     if (!terminalError) {
       const failure = terminalFailure?.(event);
       if (failure) {
         const session = sessionId ? `（session ${sessionId}）` : '';
-        terminalError = new Error(`${failure}${session}`);
+        const detail = lastErrorDetail && !failure.includes(lastErrorDetail) ? `: ${lastErrorDetail}` : '';
+        terminalError = new Error(`${failure}${detail}${session}`);
       }
     }
     const message = summarize(event);
@@ -536,6 +577,24 @@ function createJsonEventProgress({ prefix, summarize, terminalFailure }) {
 
 function codexTerminalFailure(event) {
   return event?.type === 'turn.failed' ? 'codex 模型报告执行失败' : null;
+}
+
+function eventErrorDetail(event) {
+  const values = [
+    event?.error,
+    event?.message,
+    event?.detail,
+    event?.reason,
+    event?.cause,
+    event?.item?.error,
+    event?.item?.message,
+  ];
+  for (const value of values) {
+    if (value === undefined || value === null || value === '') continue;
+    const text = typeof value === 'string' ? value : JSON.stringify(value);
+    if (text) return oneLine(text);
+  }
+  return '';
 }
 
 function extractAgentSessionId(event) {
@@ -584,8 +643,15 @@ export function summarizeOpenCodeEvent(event) {
 
 function claudeTerminalFailure(event) {
   const isResult = event?.type === 'result' || (!event?.type && (event?.result !== undefined || event?.structured_output));
-  return isResult && (event.is_error || event.subtype === 'error' || event.subtype === 'failed')
-    ? 'claude 模型报告执行失败' : null;
+  if (!isResult || !(event.is_error || event.subtype === 'error' || event.subtype === 'failed')) return null;
+  const details = [
+    event.subtype && `subtype=${event.subtype}`,
+    event.error && `error=${typeof event.error === 'string' ? event.error : JSON.stringify(event.error)}`,
+    typeof event.result === 'string' && event.result,
+    Array.isArray(event.permission_denials) && event.permission_denials.length
+      && `permission_denials=${JSON.stringify(event.permission_denials)}`,
+  ].filter(Boolean).join(' ');
+  return `claude 模型报告执行失败${details ? `: ${oneLine(details)}` : ''}`;
 }
 
 export function summarizeClaudeEvent(event) {
