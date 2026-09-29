@@ -499,6 +499,41 @@ test('manual review completion command parser accepts explicit Chinese and Engli
   assert.equal(isManualReviewCompletionRequest('收到，正在审查'), false);
 });
 
+test('manual review completion resumes a feedback round after the agent failed', async (t) => {
+  const context = await makeContext(t);
+  let addressCalls = 0;
+  const workflow = makeWorkflow(context, {
+    gitcode: {
+      getPr: async () => prDetails({ author: 'zhangsan', assignees: ['lisi'] }),
+      unresolvedSummary: async () => ({ unresolvedCount: 1, unresolvedReviewerLogins: ['lisi'] }),
+    },
+    agent: {
+      runAddressFeedback: async () => {
+        addressCalls += 1;
+        if (addressCalls === 1) throw new Error('agent timeout');
+        return { durationMs: 1, result: { commitSha: 'fixed-head' } };
+      },
+    },
+  });
+
+  await workflow.onFeishuMessage(message({
+    messageId: 'resume-start', senderOpenId: SELF.feishuOpenId,
+    text: 'https://gitcode.com/org/repo/pull/7',
+  }));
+  await workflow.onFeishuMessage(botResult('resume-result', LISI.botOpenId, 'initial', 0));
+  await waitFor(() => context.store.getPr('org/repo#7').phase === 'failed');
+  assert.equal(context.store.getPr('org/repo#7').failedFromPhase, 'addressing_feedback');
+  // Verify compatibility with states persisted before failedFromPhase existed.
+  await context.store.updatePr('org/repo#7', (current) => ({ ...current, failedFromPhase: undefined }));
+
+  await workflow.onFeishuMessage(message({
+    messageId: 'resume-manual', senderOpenId: SELF.feishuOpenId,
+    text: '手动推进：https://gitcode.com/org/repo/pull/7',
+  }));
+  await waitFor(() => context.store.getPr('org/repo#7').phase === 'awaiting_rereview');
+  assert.equal(addressCalls, 2);
+});
+
 for (const senderType of ['user', 'app']) {
   test(`review完成 summary from ${senderType} starts feedback addressing`, async (t) => {
     const context = await makeContext(t);

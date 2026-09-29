@@ -337,12 +337,21 @@ export class ReviewWorkflow {
 
   async #confirmReviewComplete(pr, event) {
     const state = this.store.getPr(pr.key);
-    if (!state || TERMINAL_PHASES.has(state.phase)) {
+    // Older failed states predate failedFromPhase. A round whose reviewers all
+    // completed and which did not stop at the cycle limit is a resumable
+    // feedback-addressing failure.
+    const legacyFeedbackFailure = state?.phase === 'failed'
+      && !state.stopReason
+      && Object.keys(state.pending || {}).length > 0
+      && Object.values(state.pending || {}).every((status) => ['done', 'manual_done'].includes(status));
+    const canResumeFeedback = state?.phase === 'failed'
+      && (state.failedFromPhase === 'addressing_feedback' || legacyFeedbackFailure);
+    if (!state || (TERMINAL_PHASES.has(state.phase) && !canResumeFeedback)) {
       await this.feishu.send(event.chatId, `该 PR 当前没有等待人工确认的审查任务：${pr.url}`,
         [this.#person(event.senderOpenId, '操作人')]);
       return { confirmed: false, reason: 'not-awaiting-review' };
     }
-    if (!['awaiting_review', 'awaiting_rereview'].includes(state.phase)) {
+    if (!canResumeFeedback && !['awaiting_review', 'awaiting_rereview'].includes(state.phase)) {
       await this.feishu.send(event.chatId,
         `该 PR 当前处于 ${state.phase}，暂不能人工确认审查完成：${pr.url}`,
         [this.#person(event.senderOpenId, '操作人')]);
@@ -356,6 +365,7 @@ export class ReviewWorkflow {
       .map(([reviewerId]) => reviewerId);
     const confirmed = await this.store.updatePr(pr.key, (current) => ({
       ...current,
+      ...(canResumeFeedback ? { phase: 'awaiting_review' } : {}),
       pending,
       manualReviewSkippedReviewers: skippedReviewers,
       manualReviewConfirmedAt: new Date().toISOString(),
@@ -622,10 +632,18 @@ export class ReviewWorkflow {
     const state = this.store.getPr(pr.key);
     if (state?.phase === 'cancelled' || isCancellationError(error)) return;
     if (state && !TERMINAL_PHASES.has(state.phase)) {
-      await this.store.updatePr(pr.key, (current) => ({ ...current, phase: 'failed', lastError: reason }));
+      await this.store.updatePr(pr.key, (current) => ({
+        ...current,
+        phase: 'failed',
+        failedFromPhase: current.phase,
+        lastError: reason,
+      }));
     }
     if (chatId) {
-      await this.feishu.send(chatId, `执行失败，已停止自动流程，可重新发起。原因：${reason} ${pr.url}`,
+      const recovery = state?.phase === 'addressing_feedback'
+        ? '，可发送“手动推进”继续处理'
+        : '，可重新发起';
+      await this.feishu.send(chatId, `执行失败，已停止自动流程${recovery}。原因：${reason} ${pr.url}`,
         state?.requesterOpenId ? [this.#person(state.requesterOpenId, state.requesterName || '发起人')] : []);
     }
   }
