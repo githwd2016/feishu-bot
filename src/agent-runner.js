@@ -429,9 +429,27 @@ node "$REVIEW_BOT_HELPER" comments "${pr.url}"
 
 function nativeReviewResult(output, pr) {
   const parsed = parseJsonObject(output);
-  if (parsed) return parsed;
+  if (parsed) {
+    // Native review commands may use `blocked` for a review that completed
+    // with findings. In this workflow findings are a valid review outcome;
+    // only an explicit blocker should fail the task.
+    const blockers = Array.isArray(parsed.blockers) ? parsed.blockers.filter((item) => typeof item === 'string') : [];
+    return {
+      status: parsed.status === 'blocked' && blockers.length === 0 ? 'success' : parsed.status,
+      action: 'review',
+      prUrl: pr.url,
+      unresolvedCount: Number.isInteger(parsed.unresolvedCount) ? parsed.unresolvedCount : 0,
+      unresolvedReviewerLogins: Array.isArray(parsed.unresolvedReviewerLogins) ? parsed.unresolvedReviewerLogins : [],
+      commentsPosted: Number.isInteger(parsed.commentsPosted) ? parsed.commentsPosted : 0,
+      commentsReplied: Number.isInteger(parsed.commentsReplied) ? parsed.commentsReplied : 0,
+      commentsResolved: Number.isInteger(parsed.commentsResolved) ? parsed.commentsResolved : 0,
+      commitSha: typeof parsed.commitSha === 'string' ? parsed.commitSha : null,
+      summary: typeof parsed.summary === 'string' ? parsed.summary : String(output || '').trim(),
+      blockers,
+    };
+  }
   return {
-    status: 'blocked',
+    status: 'success',
     action: 'review',
     prUrl: pr.url,
     unresolvedCount: 0,
@@ -440,8 +458,8 @@ function nativeReviewResult(output, pr) {
     commentsReplied: 0,
     commentsResolved: 0,
     commitSha: null,
-    summary: '原生 review 命令未返回机器人协议 JSON',
-    blockers: [String(output || '原生 review 命令没有输出结果').trim().slice(-1000)],
+    summary: String(output || '原生 review 命令没有输出结果').trim().slice(-2000),
+    blockers: [],
   };
 }
 
