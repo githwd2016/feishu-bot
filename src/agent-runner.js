@@ -357,7 +357,7 @@ export class AgentRunner {
   async #runOpenCode({ pr, prompt, workdir, env, signal, nativeReview = false }) {
     const settings = this.config.agent.opencode;
     const args = openCodeRunArgs(settings);
-    args.push(nativeReview ? `/review ${pr.url}` : prompt);
+    args.push(prompt);
     const progress = createJsonEventProgress({
       prefix: `[agent:opencode:${pr.key}]`,
       summarize: summarizeOpenCodeEvent,
@@ -412,7 +412,15 @@ function openCodeRunArgs(settings) {
 }
 
 function nativeReviewPrompt({ pr, backend, replacements }) {
-  if (backend === 'opencode') return `/review ${pr.url}`;
+  if (backend === 'opencode') {
+    return `/review ${pr.url}
+
+审查目标是 GitCode PR。只允许通过本地 $REVIEW_BOT_HELPER 命令读取和写入目标 PR，例如：
+node "$REVIEW_BOT_HELPER" pr "${pr.url}"
+node "$REVIEW_BOT_HELPER" files "${pr.url}"
+node "$REVIEW_BOT_HELPER" comments "${pr.url}"
+禁止使用 WebFetch、browser 或任何网页工具；不要直接访问 PR URL。只操作这个精确 PR。`;
+  }
   if (backend === 'claude') return `/code-review ${pr.url}`;
   // Codex's native review command accepts an optional instruction. Keep it
   // limited to the exact PR context; the review methodology comes from Codex.
