@@ -27,7 +27,11 @@ export class AgentRunner {
     return this.#run({
       pr,
       repository: this.#repository(pr, false),
-      template: 'review.md',
+      // GitCode review is provided by each agent's native review command.
+      // Keep the helper based prompt for GitHub, whose review API needs the
+      // explicit line/comment protocol below.
+      template: this.provider === 'github' ? 'review.md' : null,
+      nativeReview: this.provider !== 'github',
       replacements: { PR_URL: pr.url, REVIEW_MODE: mode, REVIEWER_NAME: reviewerName },
     });
   }
@@ -128,7 +132,7 @@ export class AgentRunner {
     return directory || null;
   }
 
-  async #run({ pr, repository, template, replacements }) {
+  async #run({ pr, repository, template, nativeReview = false, replacements }) {
     const controller = new AbortController();
     const controllers = this.activeTasks.get(pr.key) || new Set();
     controllers.add(controller);
@@ -140,6 +144,7 @@ export class AgentRunner {
       pr,
       workdir,
       template,
+      nativeReview,
       replacements: { ...replacements, WORKTREE_NOTICE: worktreeNotice },
       usesWorktree: Boolean(repository),
       signal,
@@ -154,18 +159,14 @@ export class AgentRunner {
     }
   }
 
-  async #runInWorkdir({ pr, workdir, template, replacements, usesWorktree, signal }) {
+  async #runInWorkdir({ pr, workdir, template, nativeReview, replacements, usesWorktree, signal }) {
     const backend = this.config.agent.backend;
-    const taskName = template.replace(/\.md$/, '');
+    const taskName = nativeReview ? 'review' : template.replace(/\.md$/, '');
     const startedAt = Date.now();
-    const promptBackend = backend === 'claude' ? 'opencode' : backend;
-    const promptPath = path.join(this.config.projectRoot, 'prompts', this.provider === 'github' ? 'github' : promptBackend, template);
-    let prompt = await fs.readFile(promptPath, 'utf8');
-    if (backend === 'claude') prompt = prompt.replaceAll('OpenCode', 'Claude Code');
-    for (const [key, value] of Object.entries({ ...replacements, PR_KEY: pr.key })) {
-      prompt = prompt.replaceAll(`{{${key}}}`, String(value));
-    }
-    if (this.provider === 'github') {
+    let prompt = nativeReview
+      ? nativeReviewPrompt({ pr, backend, replacements })
+      : await this.#loadPrompt({ backend, template, replacements, pr });
+    if (!nativeReview && this.provider === 'github') {
       const schema = await fs.readFile(path.join(this.config.projectRoot, 'schemas', 'agent-result.schema.json'), 'utf8');
       prompt += `\n\n最终结果必须符合以下 JSON Schema，所有 required 字段均须填写：\n${schema}`;
     }
@@ -181,10 +182,10 @@ export class AgentRunner {
     let output;
     try {
       output = backend === 'codex'
-        ? await this.#runCodex({ pr, prompt, workdir, env, signal })
+        ? await this.#runCodex({ pr, prompt, workdir, env, signal, nativeReview })
         : backend === 'claude'
-          ? await this.#runClaude({ pr, prompt, workdir, env, signal })
-          : await this.#runOpenCode({ pr, prompt, workdir, env, signal });
+          ? await this.#runClaude({ pr, prompt, workdir, env, signal, nativeReview })
+          : await this.#runOpenCode({ pr, prompt, workdir, env, signal, nativeReview });
       validateAgentResult(output.result, pr);
       if (output.result.status !== 'success') {
         const session = output.sessionId ? `（session ${output.sessionId}）` : '';
@@ -210,6 +211,17 @@ export class AgentRunner {
     }
   }
 
+  async #loadPrompt({ backend, template, replacements, pr }) {
+    const promptBackend = backend === 'claude' ? 'opencode' : backend;
+    const promptPath = path.join(this.config.projectRoot, 'prompts', this.provider === 'github' ? 'github' : promptBackend, template);
+    let prompt = await fs.readFile(promptPath, 'utf8');
+    if (backend === 'claude') prompt = prompt.replaceAll('OpenCode', 'Claude Code');
+    for (const [key, value] of Object.entries({ ...replacements, PR_KEY: pr.key })) {
+      prompt = prompt.replaceAll(`{{${key}}}`, String(value));
+    }
+    return prompt;
+  }
+
   #environment(usesWorktree) {
     const prefix = this.provider.toUpperCase();
     const env = { ...process.env };
@@ -227,12 +239,14 @@ export class AgentRunner {
     };
   }
 
-  async #runCodex({ pr, prompt, workdir, env, signal }) {
+  async #runCodex({ pr, prompt, workdir, env, signal, nativeReview = false }) {
     const settings = this.config.agent.codex;
     const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-codex-'));
-    const outputPath = path.join(tempDirectory, 'last-message.json');
+    const outputPath = path.join(tempDirectory, nativeReview ? 'last-message.txt' : 'last-message.json');
     const schemaPath = path.join(this.config.projectRoot, 'schemas', 'agent-result.schema.json');
-    const args = [
+    const args = nativeReview ? [
+      'review', '--uncommitted',
+    ] : [
       'exec', // 非交互执行一次 Codex 任务，适合后台服务调用。
       '--json', // 输出结构化事件；服务只提取阶段，不打印 agent 的原始内容。
       '--skip-git-repo-check', // 没有本地 checkout 的只读 review 也允许从项目目录运行。
@@ -241,12 +255,13 @@ export class AgentRunner {
       '--output-last-message', outputPath, // 将最终消息单独写入文件，避免从过程日志中提取 JSON。
     ];
     // 无人值守模式会取消确认和沙箱；未开启时仅允许在工作区内写文件。
-    if (settings.bypassApprovalsAndSandbox) args.push('--dangerously-bypass-approvals-and-sandbox');
-    else args.push('--sandbox', 'workspace-write');
+    if (!nativeReview && settings.bypassApprovalsAndSandbox) args.push('--dangerously-bypass-approvals-and-sandbox');
+    else if (!nativeReview) args.push('--sandbox', 'workspace-write');
     // profile 和 model 均为可选项，分别来自 CODEX_PROFILE 与 CODEX_MODEL。
     if (settings.profile) args.push('--profile', settings.profile);
     if (settings.model) args.push('--model', settings.model);
-    args.push('-'); // 从 stdin 读取 prompt，避免把长提示词放进进程命令行。
+    if (nativeReview) args.push(prompt);
+    else args.push('-'); // 从 stdin 读取 prompt，避免把长提示词放进进程命令行。
     const progress = createJsonEventProgress({
       prefix: `[agent:codex:${pr.key}]`,
       summarize: summarizeCodexEvent,
@@ -255,13 +270,24 @@ export class AgentRunner {
 
     try {
       const logs = await runProcess({
-        bin: settings.bin, args, cwd: workdir, env, stdin: prompt,
+        bin: settings.bin, args, cwd: workdir, env, stdin: nativeReview ? undefined : prompt,
         timeoutMs: this.config.agent.timeoutMs,
         signal,
         onStdout: progress.write,
         // Do not SIGTERM a failed turn before Codex persists its rollout.
-        stopOnTerminalError: false,
+        stopOnTerminalError: nativeReview,
+        // Older Codex builds may not have the review subcommand. Keep a
+        // compatibility path for those builds; successful native reviews
+        // never enter it.
+        allowNonZeroExit: nativeReview,
       });
+      if (nativeReview) {
+        const nativeResult = parseJsonObject(logs.stdout);
+        if (logs.exitCode !== undefined || !nativeResult || nativeResult.prUrl !== pr.url) {
+          return this.#runCodex({ pr, prompt, workdir, env, signal, nativeReview: false });
+        }
+        return { ...logs, sessionId: progress.sessionId, result: nativeResult };
+      }
       let resultText;
       try {
         resultText = await fs.readFile(outputPath, 'utf8');
@@ -287,16 +313,16 @@ export class AgentRunner {
     }
   }
 
-  async #runClaude({ pr, prompt, workdir, env, signal }) {
+  async #runClaude({ pr, prompt, workdir, env, signal, nativeReview = false }) {
     const settings = this.config.agent.claude;
     // JSON mode is required for schema-backed review results. Weekly reports
     // use stream-json so long-running work still emits progress events.
-    const args = ['-p', '--output-format', pr ? 'json' : 'stream-json'];
+    const args = ['-p', '--output-format', pr && !nativeReview ? 'json' : 'stream-json'];
     if (!pr) args.push('--verbose');
     if (settings.model) args.push('--model', settings.model);
     if (settings.dangerouslySkipPermissions) args.push('--dangerously-skip-permissions');
     else if (settings.permissionMode) args.push('--permission-mode', settings.permissionMode);
-    if (pr) {
+    if (pr && !nativeReview) {
       const schema = await fs.readFile(path.join(this.config.projectRoot, 'schemas', 'agent-result.schema.json'), 'utf8');
       args.push('--json-schema', schema);
     }
@@ -316,21 +342,22 @@ export class AgentRunner {
       });
       progress.flush();
       const event = parseClaudeCompletion(logs.stdout);
-      if (pr) {
+      if (pr && !nativeReview) {
         const result = event.structured_output || parseJsonObject(event.result);
         if (!result || typeof result !== 'object') throw new Error('claude 未返回符合 schema 的最终结果');
         return { ...logs, sessionId: progress.sessionId || event.session_id, result };
       }
+      if (nativeReview) return { ...logs, sessionId: progress.sessionId || event.session_id, result: nativeReviewResult(event.result, pr) };
       return { ...logs, sessionId: progress.sessionId || event.session_id, text: typeof event.result === 'string' ? event.result : '' };
     } finally {
       progress.flush();
     }
   }
 
-  async #runOpenCode({ pr, prompt, workdir, env, signal }) {
+  async #runOpenCode({ pr, prompt, workdir, env, signal, nativeReview = false }) {
     const settings = this.config.agent.opencode;
     const args = openCodeRunArgs(settings);
-    args.push(prompt);
+    args.push(nativeReview ? `/review ${pr.url}` : prompt);
     const progress = createJsonEventProgress({
       prefix: `[agent:opencode:${pr.key}]`,
       summarize: summarizeOpenCodeEvent,
@@ -340,10 +367,14 @@ export class AgentRunner {
         bin: settings.bin, args, cwd: workdir, env, timeoutMs: this.config.agent.timeoutMs,
         signal,
         onStdout: progress.write,
+        // OpenCode can persist a completed session and still exit non-zero
+        // while its JSON stream already contains the final result. Preserve
+        // that output so it can be parsed or recovered through `export`.
+        allowNonZeroExit: true,
       });
       const sessionId = progress.sessionId || extractOpenCodeSessionId(logs.stdout);
       try {
-        return { ...logs, sessionId, result: parseOpenCodeResult(logs.stdout) };
+        return { ...logs, sessionId, result: nativeReview ? nativeReviewResult(parseOpenCodeText(logs.stdout), pr) : parseOpenCodeResult(logs.stdout) };
       } catch (error) {
         if (!sessionId) throw error;
         const exported = await runProcess({
@@ -358,7 +389,7 @@ export class AgentRunner {
           stdout: logs.stdout,
           stderr: `${logs.stderr}${exported.stderr}`,
           sessionId,
-          result: parseOpenCodeExport(exported.stdout),
+          result: nativeReview ? nativeReviewResult(parseOpenCodeText(exported.stdout), pr) : parseOpenCodeExport(exported.stdout),
         };
       }
     } finally {
@@ -380,9 +411,35 @@ function openCodeRunArgs(settings) {
   return args;
 }
 
+function nativeReviewPrompt({ pr, backend, replacements }) {
+  if (backend === 'opencode') return `/review ${pr.url}`;
+  if (backend === 'claude') return `/code-review ${pr.url}`;
+  // Codex's native review command accepts an optional instruction. Keep it
+  // limited to the exact PR context; the review methodology comes from Codex.
+  return `Review the exact PR ${pr.url} in ${replacements.REVIEW_MODE || 'initial'} mode.\n${replacements.WORKTREE_NOTICE || ''}`;
+}
+
+function nativeReviewResult(output, pr) {
+  const parsed = parseJsonObject(output);
+  if (parsed) return parsed;
+  return {
+    status: 'blocked',
+    action: 'review',
+    prUrl: pr.url,
+    unresolvedCount: 0,
+    unresolvedReviewerLogins: [],
+    commentsPosted: 0,
+    commentsReplied: 0,
+    commentsResolved: 0,
+    commitSha: null,
+    summary: '原生 review 命令未返回机器人协议 JSON',
+    blockers: [String(output || '原生 review 命令没有输出结果').trim().slice(-1000)],
+  };
+}
+
 function runProcess({
   bin, args, cwd, env, stdin, timeoutMs, onStdout, onStderr, signal,
-  stopOnTerminalError = true, terminalErrorGraceMs = 30_000,
+  stopOnTerminalError = true, terminalErrorGraceMs = 30_000, allowNonZeroExit = false,
 }) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -424,6 +481,10 @@ function runProcess({
       }
       if (code === 0) {
         resolve({ stdout, stderr });
+        return;
+      }
+      if (allowNonZeroExit) {
+        resolve({ stdout, stderr, exitCode: code, exitSignal });
         return;
       }
       reject(new Error(`${path.basename(bin)} 退出异常 code=${code} signal=${exitSignal || '-'} stderr=${stderr.slice(-2000)}`));

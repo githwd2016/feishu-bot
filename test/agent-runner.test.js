@@ -116,6 +116,8 @@ const result = {
 };
 process.stdout.write(JSON.stringify({ type: 'step_start', sessionID: 'opencode-session-test', part: { type: 'step-start' } }) + '\\n');
 process.stdout.write(JSON.stringify({ type: 'text', part: { type: 'text', text: JSON.stringify(result) } }) + '\\n');
+// OpenCode may leave a completed JSON stream behind while exiting non-zero.
+process.exitCode = 1;
 `, { mode: 0o755 });
   const runner = new AgentRunner({
     projectRoot,

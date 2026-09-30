@@ -11,7 +11,7 @@ GitCode 扫描规则：
 - 审查意见产生后，PR 作者的机器人会自动修改、测试、提交、回复并请求原审查人复审；
 - 全部意见解决后只通知可以合入，不自动执行评审通过或合并。
 
-支持 Codex、OpenCode 和 Claude Code 三种 agent 后端。GitCode 的 Codex 任务使用已安装插件，OpenCode/Claude Code 使用项目内的 GitCode helper；GitHub 任务在三种后端中都使用项目内的 GitHub helper。GitHub 根据个人 Reviewers 请求发现待审 PR，不能把 Assignees 当作审查人。
+支持 Codex、OpenCode 和 Claude Code 三种 agent 后端。GitCode 的审查直接使用 agent 自带的 review 入口：Codex 调用 `codex review`，OpenCode 调用 `/review`，Claude Code 调用 `/code-review`；其他任务继续使用项目内的 helper。GitHub 任务在三种后端中都使用项目内的 GitHub helper。GitHub 根据个人 Reviewers 请求发现待审 PR，不能把 Assignees 当作审查人。
 
 ## 运行要求
 
