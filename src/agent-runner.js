@@ -186,6 +186,9 @@ export class AgentRunner {
         : backend === 'claude'
           ? await this.#runClaude({ pr, prompt, workdir, env, signal, nativeReview })
           : await this.#runOpenCode({ pr, prompt, workdir, env, signal, nativeReview });
+      if (nativeReview && output.nativeProtocolError && backend === 'opencode') {
+        output = await this.#repairOpenCodeReview({ output, pr, workdir, env, signal });
+      }
       if (nativeReview && this.provider === 'gitcode') {
         output = await this.#publishNativeFindings({ output, pr, workdir, env, signal });
       }
@@ -277,6 +280,55 @@ export class AgentRunner {
           blockers: [...new Set([...(output.result.blockers || []), `inline comment 写入或验证失败: ${oneLine(error.message)}`])],
         },
       };
+    }
+  }
+
+  async #repairOpenCodeReview({ output, pr, workdir, env, signal }) {
+    const repairPrompt = `/review ${pr.url}
+
+上一轮审查已经完成，但最终输出不是合法 JSON。请保留上一轮审查结论，只做格式修复。
+上一轮输出：
+${String(output.stdout || '').slice(-30_000)}
+
+只输出一个 JSON 对象，不要 Markdown，不要解释：
+{"findings":[{"path":"repo/relative.py","position":123,"body":"确定的缺陷说明"}],"summary":"审查摘要"}
+没有确定缺陷时 findings 必须为空。不要使用 WebFetch、browser 或直接访问 PR URL。`;
+    const settings = this.config.agent.opencode;
+    const progress = createJsonEventProgress({
+      prefix: `[agent:opencode:${pr.key}:repair]`,
+      summarize: summarizeOpenCodeEvent,
+    });
+    try {
+      const logs = await runProcess({
+        bin: settings.bin,
+        args: [...openCodeRunArgs(settings), repairPrompt],
+        cwd: workdir,
+        env,
+        timeoutMs: this.config.agent.timeoutMs,
+        signal,
+        onStdout: progress.write,
+        allowNonZeroExit: true,
+      });
+      const text = parseOpenCodeText(logs.stdout);
+      const repaired = nativeReviewResult(text, pr);
+      return {
+        ...logs,
+        sessionId: progress.sessionId || output.sessionId,
+        result: repaired,
+        nativeFindings: nativeFindings(text),
+        nativeProtocolError: !isNativeReviewJson(text, pr),
+      };
+    } catch (error) {
+      return {
+        ...output,
+        result: {
+          ...output.result,
+          status: 'blocked',
+          blockers: [...new Set([...(output.result.blockers || []), `JSON 修复调用失败: ${oneLine(error.message)}`])],
+        },
+      };
+    } finally {
+      progress.flush();
     }
   }
 
@@ -443,6 +495,7 @@ export class AgentRunner {
           sessionId,
           result: nativeReview ? nativeReviewResult(text, pr) : parseOpenCodeResult(logs.stdout),
           nativeFindings: nativeReview ? nativeFindings(text) : undefined,
+          nativeProtocolError: nativeReview ? !isNativeReviewJson(text, pr) : false,
         };
       } catch (error) {
         if (!sessionId) throw error;
@@ -460,6 +513,7 @@ export class AgentRunner {
           sessionId,
           result: nativeReview ? nativeReviewResult(parseOpenCodeText(exported.stdout), pr) : parseOpenCodeExport(exported.stdout),
           nativeFindings: nativeReview ? nativeFindings(parseOpenCodeText(exported.stdout)) : undefined,
+          nativeProtocolError: nativeReview ? !isNativeReviewJson(parseOpenCodeText(exported.stdout), pr) : false,
         };
       }
     } finally {
@@ -542,6 +596,12 @@ function nativeFindings(output) {
   return parsed.findings.map((finding) => ({
     path: finding.path.trim(), position: finding.position, body: finding.body.trim(),
   }));
+}
+
+function isNativeReviewJson(output, pr) {
+  const parsed = parseJsonObject(output);
+  return Boolean(parsed && ((Array.isArray(parsed.findings) && parsed.findings.every(isNativeFinding))
+    || (parsed.status === 'success' && parsed.prUrl === pr.url && parsed.findings === undefined)));
 }
 
 function isNativeFinding(finding) {
