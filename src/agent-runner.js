@@ -186,6 +186,9 @@ export class AgentRunner {
         : backend === 'claude'
           ? await this.#runClaude({ pr, prompt, workdir, env, signal, nativeReview })
           : await this.#runOpenCode({ pr, prompt, workdir, env, signal, nativeReview });
+      if (nativeReview && this.provider === 'gitcode') {
+        output = await this.#publishNativeFindings({ output, pr, workdir, env, signal });
+      }
       validateAgentResult(output.result, pr);
       if (output.result.status !== 'success') {
         const session = output.sessionId ? `（session ${output.sessionId}）` : '';
@@ -220,6 +223,61 @@ export class AgentRunner {
       prompt = prompt.replaceAll(`{{${key}}}`, String(value));
     }
     return prompt;
+  }
+
+  async #publishNativeFindings({ output, pr, workdir, env, signal }) {
+    const findings = output.nativeFindings || [];
+    if (findings.length === 0) return output;
+    const helper = path.join(this.config.projectRoot, 'scripts', 'gitcode-api.js');
+    let commentsPosted = 0;
+    try {
+      for (const finding of findings) {
+        const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-review-comment-'));
+        const bodyPath = path.join(directory, 'body.md');
+        try {
+          await fs.writeFile(bodyPath, finding.body, 'utf8');
+          await runProcess({
+            bin: process.execPath,
+            args: [helper, 'inline', pr.url, '--path', finding.path, '--position', String(finding.position),
+              '--body-file', bodyPath, '--confirm-target', pr.key],
+            cwd: workdir,
+            env,
+            timeoutMs: Math.min(this.config.agent.timeoutMs, 60_000),
+            signal,
+          });
+          commentsPosted += 1;
+        } finally {
+          await fs.rm(directory, { recursive: true, force: true });
+        }
+      }
+      const verification = await runProcess({
+        bin: process.execPath,
+        args: [helper, 'comments', pr.url],
+        cwd: workdir,
+        env,
+        timeoutMs: Math.min(this.config.agent.timeoutMs, 60_000),
+        signal,
+      });
+      JSON.parse(verification.stdout);
+      return {
+        ...output,
+        result: {
+          ...output.result,
+          unresolvedCount: Math.max(output.result.unresolvedCount, commentsPosted),
+          commentsPosted: output.result.commentsPosted + commentsPosted,
+        },
+        nativeFindings: undefined,
+      };
+    } catch (error) {
+      return {
+        ...output,
+        result: {
+          ...output.result,
+          status: 'blocked',
+          blockers: [...new Set([...(output.result.blockers || []), `inline comment 写入或验证失败: ${oneLine(error.message)}`])],
+        },
+      };
+    }
   }
 
   #environment(usesWorktree) {
@@ -347,7 +405,12 @@ export class AgentRunner {
         if (!result || typeof result !== 'object') throw new Error('claude 未返回符合 schema 的最终结果');
         return { ...logs, sessionId: progress.sessionId || event.session_id, result };
       }
-      if (nativeReview) return { ...logs, sessionId: progress.sessionId || event.session_id, result: nativeReviewResult(event.result, pr) };
+      if (nativeReview) return {
+        ...logs,
+        sessionId: progress.sessionId || event.session_id,
+        result: nativeReviewResult(event.result, pr),
+        nativeFindings: nativeFindings(event.result),
+      };
       return { ...logs, sessionId: progress.sessionId || event.session_id, text: typeof event.result === 'string' ? event.result : '' };
     } finally {
       progress.flush();
@@ -374,7 +437,13 @@ export class AgentRunner {
       });
       const sessionId = progress.sessionId || extractOpenCodeSessionId(logs.stdout);
       try {
-        return { ...logs, sessionId, result: nativeReview ? nativeReviewResult(parseOpenCodeText(logs.stdout), pr) : parseOpenCodeResult(logs.stdout) };
+        const text = parseOpenCodeText(logs.stdout);
+        return {
+          ...logs,
+          sessionId,
+          result: nativeReview ? nativeReviewResult(text, pr) : parseOpenCodeResult(logs.stdout),
+          nativeFindings: nativeReview ? nativeFindings(text) : undefined,
+        };
       } catch (error) {
         if (!sessionId) throw error;
         const exported = await runProcess({
@@ -390,6 +459,7 @@ export class AgentRunner {
           stderr: `${logs.stderr}${exported.stderr}`,
           sessionId,
           result: nativeReview ? nativeReviewResult(parseOpenCodeText(exported.stdout), pr) : parseOpenCodeExport(exported.stdout),
+          nativeFindings: nativeReview ? nativeFindings(parseOpenCodeText(exported.stdout)) : undefined,
         };
       }
     } finally {
@@ -419,7 +489,9 @@ function nativeReviewPrompt({ pr, backend, replacements }) {
 node "$REVIEW_BOT_HELPER" pr "${pr.url}"
 node "$REVIEW_BOT_HELPER" files "${pr.url}"
 node "$REVIEW_BOT_HELPER" comments "${pr.url}"
-禁止使用 WebFetch、browser 或任何网页工具；不要直接访问 PR URL。只操作这个精确 PR。`;
+禁止使用 WebFetch、browser 或任何网页工具；不要直接访问 PR URL。只操作这个精确 PR。
+发现确定缺陷后不要直接调用网页工具，先把每条 finding 放入 findings；由机器人随后使用 inline helper 发布并验证。
+最终只输出 JSON：{"findings":[{"path":"repo/relative.py","position":123,"body":"确定的缺陷说明"}],"summary":"审查摘要"}。没有问题时 findings 必须为空。`;
   }
   if (backend === 'claude') return `/code-review ${pr.url}`;
   // Codex's native review command accepts an optional instruction. Keep it
@@ -435,7 +507,7 @@ function nativeReviewResult(output, pr) {
     // only an explicit blocker should fail the task.
     const blockers = Array.isArray(parsed.blockers) ? parsed.blockers.filter((item) => typeof item === 'string') : [];
     return {
-      status: parsed.status === 'blocked' && blockers.length === 0 ? 'success' : parsed.status,
+      status: parsed.status === 'blocked' && blockers.length > 0 ? 'blocked' : 'success',
       action: 'review',
       prUrl: pr.url,
       unresolvedCount: Number.isInteger(parsed.unresolvedCount) ? parsed.unresolvedCount : 0,
@@ -461,6 +533,19 @@ function nativeReviewResult(output, pr) {
     summary: String(output || '原生 review 命令没有输出结果').trim().slice(-2000),
     blockers: [],
   };
+}
+
+function nativeFindings(output) {
+  const parsed = parseJsonObject(output);
+  if (!Array.isArray(parsed?.findings)) return [];
+  return parsed.findings.filter((finding) => (
+    finding && typeof finding.path === 'string' && finding.path.trim()
+    && !path.isAbsolute(finding.path) && !path.normalize(finding.path).startsWith(`..${path.sep}`)
+    && Number.isInteger(finding.position) && finding.position > 0
+    && typeof finding.body === 'string' && finding.body.trim()
+  )).map((finding) => ({
+    path: finding.path.trim(), position: finding.position, body: finding.body.trim(),
+  }));
 }
 
 function runProcess({
