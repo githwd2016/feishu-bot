@@ -501,7 +501,8 @@ node "$REVIEW_BOT_HELPER" comments "${pr.url}"
 
 function nativeReviewResult(output, pr) {
   const parsed = parseJsonObject(output);
-  if (parsed) {
+  if (parsed && ((Array.isArray(parsed.findings) && parsed.findings.every(isNativeFinding))
+    || (parsed.status === 'success' && parsed.prUrl === pr.url && parsed.findings === undefined))) {
     // Native review commands may use `blocked` for a review that completed
     // with findings. In this workflow findings are a valid review outcome;
     // only an explicit blocker should fail the task.
@@ -521,7 +522,7 @@ function nativeReviewResult(output, pr) {
     };
   }
   return {
-    status: 'success',
+    status: 'blocked',
     action: 'review',
     prUrl: pr.url,
     unresolvedCount: 0,
@@ -530,22 +531,24 @@ function nativeReviewResult(output, pr) {
     commentsReplied: 0,
     commentsResolved: 0,
     commitSha: null,
-    summary: String(output || '原生 review 命令没有输出结果').trim().slice(-2000),
-    blockers: [],
+    summary: '原生 review 未返回符合约定的 JSON findings',
+    blockers: ['必须返回包含 findings 数组的 JSON 对象，不能返回 Markdown 或纯文本'],
   };
 }
 
 function nativeFindings(output) {
   const parsed = parseJsonObject(output);
-  if (!Array.isArray(parsed?.findings)) return [];
-  return parsed.findings.filter((finding) => (
-    finding && typeof finding.path === 'string' && finding.path.trim()
-    && !path.isAbsolute(finding.path) && !path.normalize(finding.path).startsWith(`..${path.sep}`)
-    && Number.isInteger(finding.position) && finding.position > 0
-    && typeof finding.body === 'string' && finding.body.trim()
-  )).map((finding) => ({
+  if (!Array.isArray(parsed?.findings) || !parsed.findings.every(isNativeFinding)) return [];
+  return parsed.findings.map((finding) => ({
     path: finding.path.trim(), position: finding.position, body: finding.body.trim(),
   }));
+}
+
+function isNativeFinding(finding) {
+  return finding && typeof finding.path === 'string' && finding.path.trim()
+    && !path.isAbsolute(finding.path) && !path.normalize(finding.path).startsWith(`..${path.sep}`)
+    && Number.isInteger(finding.position) && finding.position > 0
+    && typeof finding.body === 'string' && finding.body.trim();
 }
 
 function runProcess({
