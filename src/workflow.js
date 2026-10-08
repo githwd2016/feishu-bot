@@ -89,6 +89,12 @@ export class ReviewWorkflow {
       await this.feishu.send(event.chatId, '请使用文本消息并附上 PR 链接。');
       return;
     }
+    // Feishu may deliver the bot's own group message back through the event
+    // stream. It must never be treated as a new user review request.
+    if (event.senderOpenId === this.identities.self.botOpenId) {
+      console.log(`[workflow] 忽略当前 bot 自身回流消息 message=${event.messageId}`);
+      return;
+    }
 
     const protocol = parseReviewBotProtocol(event.text);
     if (isWeeklyReportRequest(event.text) && !isBotSender(event, protocol)) {
