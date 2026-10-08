@@ -232,6 +232,7 @@ export class AgentRunner {
     const findings = output.nativeFindings || [];
     if (findings.length === 0) return output;
     const helper = path.join(this.config.projectRoot, 'scripts', 'gitcode-api.js');
+    const diffMap = await this.#loadGitCodeDiffMap({ helper, pr, workdir, env, signal });
     let commentsPosted = 0;
     try {
       for (const finding of findings) {
@@ -239,15 +240,31 @@ export class AgentRunner {
         const bodyPath = path.join(directory, 'body.md');
         try {
           await fs.writeFile(bodyPath, finding.body, 'utf8');
-          await runProcess({
-            bin: process.execPath,
-            args: [helper, 'inline', pr.url, '--path', finding.path, '--position', String(finding.position),
-              '--body-file', bodyPath, '--confirm-target', pr.key],
-            cwd: workdir,
-            env,
-            timeoutMs: Math.min(this.config.agent.timeoutMs, 60_000),
-            signal,
-          });
+          const positions = [finding.position, diffMap.get(`${finding.path}:${finding.position}`)].filter(
+            (position, index, values) => Number.isInteger(position) && position > 0 && values.indexOf(position) === index,
+          );
+          if (positions.length === 0) throw new Error(`finding 行号不在 PR diff 中: ${finding.path}:${finding.position}`);
+          let posted = false;
+          let lastError;
+          for (const position of positions) {
+            try {
+              await runProcess({
+                bin: process.execPath,
+                args: [helper, 'inline', pr.url, '--path', finding.path, '--position', String(position),
+                  '--body-file', bodyPath, '--confirm-target', pr.key],
+                cwd: workdir,
+                env,
+                timeoutMs: Math.min(this.config.agent.timeoutMs, 60_000),
+                signal,
+              });
+              posted = true;
+              break;
+            } catch (error) {
+              lastError = error;
+              if (!/invalid params under position|position param/i.test(error.message)) throw error;
+            }
+          }
+          if (!posted) throw lastError || new Error(`无法发布 inline comment: ${finding.path}:${finding.position}`);
           commentsPosted += 1;
         } finally {
           await fs.rm(directory, { recursive: true, force: true });
@@ -281,6 +298,27 @@ export class AgentRunner {
         },
       };
     }
+  }
+
+  async #loadGitCodeDiffMap({ helper, pr, workdir, env, signal }) {
+    const result = await runProcess({
+      bin: process.execPath,
+      args: [helper, 'files', pr.url],
+      cwd: workdir,
+      env,
+      timeoutMs: Math.min(this.config.agent.timeoutMs, 60_000),
+      signal,
+    });
+    let files;
+    try { files = JSON.parse(result.stdout); } catch { throw new Error('GitCode changed files 返回了无效 JSON'); }
+    if (!Array.isArray(files)) throw new Error('GitCode changed files 返回了非数组');
+    const positions = new Map();
+    for (const file of files) {
+      const filePath = file?.filename || file?.new_path || file?.path;
+      if (typeof filePath !== 'string' || typeof file?.patch !== 'string') continue;
+      for (const [line, position] of diffLinePositions(file.patch)) positions.set(`${filePath}:${line}`, position);
+    }
+    return positions;
   }
 
   async #repairOpenCodeReview({ output, pr, workdir, env, signal }) {
@@ -602,6 +640,27 @@ function isNativeReviewJson(output, pr) {
   const parsed = parseJsonObject(output);
   return Boolean(parsed && ((Array.isArray(parsed.findings) && parsed.findings.every(isNativeFinding))
     || (parsed.status === 'success' && parsed.prUrl === pr.url && parsed.findings === undefined)));
+}
+
+function diffLinePositions(patch) {
+  const result = [];
+  let newLine = 0;
+  let diffPosition = 0;
+  for (const line of String(patch).split(/\r?\n/)) {
+    const header = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (header) {
+      newLine = Number(header[1]);
+      diffPosition = 0;
+      continue;
+    }
+    if (!newLine || line.startsWith('\\')) continue;
+    diffPosition += 1;
+    if (line.startsWith('+') || line.startsWith(' ')) {
+      if (line.startsWith('+')) result.push([newLine, diffPosition]);
+      newLine += 1;
+    }
+  }
+  return result;
 }
 
 function isNativeFinding(finding) {
