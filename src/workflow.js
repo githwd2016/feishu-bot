@@ -450,6 +450,13 @@ export class ReviewWorkflow {
     if (TERMINAL_PHASES.has(this.store.getPr(pr.key)?.phase)) return;
 
     const targets = reviewersForLogins(state.reviewers || [], inspection.unresolvedReviewerLogins);
+    if (targets.length === 0) {
+      const reason = `未解决评论的 reviewer 无法匹配到已配置身份：${inspection.unresolvedReviewerLogins.join(', ') || '未知'}`;
+      await this.store.updatePr(pr.key, (current) => ({ ...current, phase: 'failed', lastError: reason }));
+      await this.feishu.send(state.chatId, `无法确定需要复审的 reviewer，已停止自动流程：${pr.url}`,
+        [this.#person(state.requesterOpenId, state.requesterName)]);
+      return;
+    }
     const pending = Object.fromEntries(targets.map((reviewer) => [reviewer.id, 'pending']));
     const next = await this.store.updatePr(pr.key, (current) => ({
       ...current,
@@ -783,7 +790,10 @@ function isBotSender(event, protocol) {
 function reviewersForLogins(reviewers, reviewerLogins) {
   const logins = new Set(reviewerLogins.map((item) => item.toLowerCase()).filter(Boolean));
   const matched = reviewers.filter((reviewer) => identityLogin(reviewer) && logins.has(identityLogin(reviewer).toLowerCase()));
-  return matched.length > 0 ? matched : reviewers;
+  // When the platform gives us reviewer logins, only those reviewers own the
+  // unresolved discussions. Fall back to everyone only when the API omitted
+  // author information entirely.
+  return logins.size > 0 ? matched : reviewers;
 }
 
 export function reviewerFromIdentity(identity) {
