@@ -544,7 +544,10 @@ ${String(output.stdout || '').slice(-30_000)}
           env,
           timeoutMs: Math.min(this.config.agent.timeoutMs, 60_000),
           signal,
+          // Export is one JSON document, so retaining only its tail corrupts it.
+          stdoutLimit: 20_000_000,
         });
+        if (exported.stdoutTruncated) throw new Error('OpenCode session export 超过 2000 万字符，无法完整解析');
         return {
           stdout: logs.stdout,
           stderr: `${logs.stderr}${exported.stderr}`,
@@ -673,6 +676,7 @@ function isNativeFinding(finding) {
 function runProcess({
   bin, args, cwd, env, stdin, timeoutMs, onStdout, onStderr, signal,
   stopOnTerminalError = true, terminalErrorGraceMs = 30_000, allowNonZeroExit = false,
+  stdoutLimit = 200_000,
 }) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -686,6 +690,7 @@ function runProcess({
       stdio: [stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
+    let stdoutTruncated = false;
     let stderr = '';
     let timedOut = false;
     let terminalError;
@@ -713,11 +718,11 @@ function runProcess({
         return;
       }
       if (code === 0) {
-        resolve({ stdout, stderr });
+        resolve({ stdout, stderr, ...(stdoutTruncated ? { stdoutTruncated: true } : {}) });
         return;
       }
       if (allowNonZeroExit) {
-        resolve({ stdout, stderr, exitCode: code, exitSignal });
+        resolve({ stdout, stderr, exitCode: code, exitSignal, ...(stdoutTruncated ? { stdoutTruncated: true } : {}) });
         return;
       }
       reject(new Error(`${path.basename(bin)} 退出异常 code=${code} signal=${exitSignal || '-'} stderr=${stderr.slice(-2000)}`));
@@ -762,7 +767,9 @@ function runProcess({
     signal?.addEventListener('abort', onAbort, { once: true });
     if (signal?.aborted) onAbort();
     child.stdout.on('data', (chunk) => {
-      stdout = appendBounded(stdout, chunk);
+      const next = stdout + chunk.toString();
+      if (next.length > stdoutLimit) stdoutTruncated = true;
+      stdout = next.length > stdoutLimit ? next.slice(-stdoutLimit) : next;
       stopForTerminalError(onStdout?.(chunk.toString()));
     });
     child.stderr.on('data', (chunk) => {
@@ -1037,6 +1044,10 @@ export function parseOpenCodeExport(stdout) {
   for (const text of texts.reverse()) {
     const parsed = parseJsonObject(text);
     if (parsed) return parsed;
+  }
+  const lastAssistant = exported.messages?.findLast((message) => message.type === 'assistant' || message.info?.role === 'assistant');
+  if (lastAssistant?.finish === 'length' || lastAssistant?.info?.finish === 'length') {
+    throw new Error('OpenCode 达到模型输出长度上限，任务未生成最终结果；请缩小任务范围后重试');
   }
   throw new Error('OpenCode session export 中没有可解析的 JSON 最终结果');
 }

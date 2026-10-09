@@ -292,6 +292,43 @@ test('OpenCode export fallback finds the last structured assistant text', () => 
   assert.equal(result.prUrl, 'x');
 });
 
+test('OpenCode export reports an interrupted length-limited session', () => {
+  assert.throws(() => parseOpenCodeExport(JSON.stringify({ messages: [
+    { type: 'assistant', finish: 'length', content: [{ type: 'text', text: 'Still working' }] },
+    { type: 'idle', outcome: 'succeeded' },
+  ] })), /模型输出长度上限/);
+});
+
+test('AgentRunner preserves large OpenCode session exports', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'fake-opencode-export-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const bin = path.join(directory, 'opencode');
+  await fs.writeFile(bin, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === 'run') {
+  process.stdout.write(JSON.stringify({ type: 'step_start', sessionID: 'ses_large' }) + '\\n');
+} else {
+  if (args.join(' ') !== 'session export ses_large') process.exit(2);
+  process.stdout.write(JSON.stringify({ messages: [
+    { type: 'assistant', content: [{ type: 'text', text: 'x'.repeat(550000) }] },
+    { type: 'assistant', content: [{ type: 'text', text: JSON.stringify({
+      status: 'success', action: 'inspect', prUrl: 'https://gitcode.com/org/repo/pull/9',
+      unresolvedCount: 0, unresolvedReviewerLogins: [], commentsPosted: 0,
+      commentsReplied: 0, commentsResolved: 0, commitSha: null, summary: 'ok', blockers: [],
+    }) }] },
+  ] }));
+}
+`, { mode: 0o755 });
+  const runner = new AgentRunner({
+    projectRoot,
+    gitcode: { token: 'test-token', apiBase: 'https://api.gitcode.com/api/v5', allowedRepos: new Set(['org/repo']), workdirs: {} },
+    agent: { backend: 'opencode', timeoutMs: 5000, opencode: { bin } },
+  });
+  const output = await runner.runInspect({ pr: parsePrUrl('https://gitcode.com/org/repo/pull/9') });
+  assert.equal(output.result.status, 'success');
+  assert.equal(output.sessionId, 'ses_large');
+});
+
 function git(cwd, ...args) {
   return execFileAsync('git', args, { cwd, encoding: 'utf8' });
 }
