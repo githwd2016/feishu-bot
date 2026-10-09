@@ -308,8 +308,11 @@ export class AgentRunner {
       env,
       timeoutMs: Math.min(this.config.agent.timeoutMs, 60_000),
       signal,
+      // A PR file list includes full patches and can exceed the normal log limit.
+      stdoutLimit: 20_000_000,
     });
     let files;
+    if (result.stdoutTruncated) throw new Error('GitCode changed files 输出超过 2000 万字符，无法完整解析');
     try { files = JSON.parse(result.stdout); } catch { throw new Error('GitCode changed files 返回了无效 JSON'); }
     if (!Array.isArray(files)) throw new Error('GitCode changed files 返回了非数组');
     const positions = new Map();
