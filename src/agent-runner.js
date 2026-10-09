@@ -539,7 +539,7 @@ ${String(output.stdout || '').slice(-30_000)}
         if (!sessionId) throw error;
         const exported = await runProcess({
           bin: settings.bin,
-          args: ['export', sessionId],
+          args: ['session', 'export', sessionId],
           cwd: workdir,
           env,
           timeoutMs: Math.min(this.config.agent.timeoutMs, 60_000),
