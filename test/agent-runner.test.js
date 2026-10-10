@@ -292,6 +292,12 @@ test('OpenCode export fallback finds the last structured assistant text', () => 
   assert.equal(result.prUrl, 'x');
 });
 
+test('OpenCode export tolerates diagnostic lines around the JSON document', () => {
+  const exported = JSON.stringify({ messages: [{ content: [{ type: 'text', text: '{"status":"success","prUrl":"x"}' }] }] });
+  const result = parseOpenCodeExport(`warning: using cached session\n${exported}\nexport complete`);
+  assert.equal(result.status, 'success');
+});
+
 test('OpenCode export reports an interrupted length-limited session', () => {
   assert.throws(() => parseOpenCodeExport(JSON.stringify({ messages: [
     { type: 'assistant', finish: 'length', content: [{ type: 'text', text: 'Still working' }] },

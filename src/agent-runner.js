@@ -1041,7 +1041,11 @@ export function extractOpenCodeSessionId(stdout) {
 
 export function parseOpenCodeExport(stdout) {
   let exported;
-  try { exported = JSON.parse(stdout); } catch { throw new Error('OpenCode export 返回了无效 JSON'); }
+  try {
+    exported = parseJsonDocument(stdout);
+  } catch {
+    throw new Error('OpenCode export 返回了无效 JSON');
+  }
   const texts = [];
   collectTextParts(exported, texts);
   for (const text of texts.reverse()) {
@@ -1053,6 +1057,20 @@ export function parseOpenCodeExport(stdout) {
     throw new Error('OpenCode 达到模型输出长度上限，任务未生成最终结果；请缩小任务范围后重试');
   }
   throw new Error('OpenCode session export 中没有可解析的 JSON 最终结果');
+}
+
+// `session export` normally writes one JSON document, but some OpenCode
+// versions prepend/append diagnostic lines. Accept the document when it is
+// surrounded by such lines while still rejecting truncated JSON.
+function parseJsonDocument(value) {
+  const text = String(value).trim();
+  try { return JSON.parse(text); } catch {}
+  const starts = [text.indexOf('{'), text.indexOf('[')].filter((index) => index >= 0);
+  if (!starts.length) throw new Error('no JSON document');
+  const start = Math.min(...starts);
+  const end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));
+  if (end < start) throw new Error('incomplete JSON document');
+  return JSON.parse(text.slice(start, end + 1));
 }
 
 function collectTextParts(value, output) {
