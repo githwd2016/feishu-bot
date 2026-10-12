@@ -325,11 +325,18 @@ export class AgentRunner {
   }
 
   async #repairOpenCodeReview({ output, pr, workdir, env, signal }) {
+    // 修复会话需要的是上一轮 assistant 的结论文本；原始 stdout 是
+    // --format json 事件流，直接塞给模型只会得到乱码上下文。
+    const previousText = parseOpenCodeText(output.stdout).trim();
+    if (!previousText) {
+      // 没有任何结论文本时无内容可修复，直接保留原有的阻塞结果。
+      return { ...output, nativeProtocolError: true };
+    }
     const repairPrompt = `/review ${pr.url}
 
 上一轮审查已经完成，但最终输出不是合法 JSON。请保留上一轮审查结论，只做格式修复。
 上一轮输出：
-${String(output.stdout || '').slice(-30_000)}
+${previousText.slice(-30_000)}
 
 只输出一个 JSON 对象，不要 Markdown，不要解释：
 {"findings":[{"path":"repo/relative.py","position":123,"body":"确定的缺陷说明"}],"summary":"审查摘要"}
@@ -529,8 +536,17 @@ ${String(output.stdout || '').slice(-30_000)}
         allowNonZeroExit: true,
       });
       const sessionId = progress.sessionId || extractOpenCodeSessionId(logs.stdout);
+      // Provider/model failures surface as a terminal `error` event on stdout
+      // (usually with exit code 1). Report the real reason instead of letting
+      // the run degrade into export fallback or JSON repair, which cannot
+      // recover a dead run.
+      const streamFailure = openCodeStreamError(logs.stdout);
+      const streamFailureError = streamFailure
+        ? new Error(`opencode 模型执行失败: ${oneLine(streamFailure)}${sessionId ? `（session ${sessionId}）` : ''}`)
+        : null;
       try {
         const text = parseOpenCodeText(logs.stdout);
+        if (nativeReview && !isNativeReviewJson(text, pr) && streamFailureError) throw streamFailureError;
         return {
           ...logs,
           sessionId,
@@ -539,30 +555,52 @@ ${String(output.stdout || '').slice(-30_000)}
           nativeProtocolError: nativeReview ? !isNativeReviewJson(text, pr) : false,
         };
       } catch (error) {
+        if (streamFailureError) throw streamFailureError;
         if (!sessionId) throw error;
-        const exported = await runProcess({
-          bin: settings.bin,
-          args: ['session', 'export', sessionId],
-          cwd: workdir,
-          env,
-          timeoutMs: Math.min(this.config.agent.timeoutMs, 60_000),
-          signal,
-          // Export is one JSON document, so retaining only its tail corrupts it.
-          stdoutLimit: 20_000_000,
-        });
-        if (exported.stdoutTruncated) throw new Error('OpenCode session export 超过 2000 万字符，无法完整解析');
+        const exported = await this.#exportOpenCodeSession({ settings, workdir, env, signal, sessionId });
+        const text = parseOpenCodeText(exported.stdout);
+        if (nativeReview && !isNativeReviewJson(text, pr) && streamFailureError) throw streamFailureError;
         return {
           stdout: logs.stdout,
           stderr: `${logs.stderr}${exported.stderr}`,
           sessionId,
-          result: nativeReview ? nativeReviewResult(parseOpenCodeText(exported.stdout), pr) : parseOpenCodeExport(exported.stdout),
-          nativeFindings: nativeReview ? nativeFindings(parseOpenCodeText(exported.stdout)) : undefined,
-          nativeProtocolError: nativeReview ? !isNativeReviewJson(parseOpenCodeText(exported.stdout), pr) : false,
+          result: nativeReview ? nativeReviewResult(text, pr) : parseOpenCodeExport(exported.stdout),
+          nativeFindings: nativeReview ? nativeFindings(text) : undefined,
+          nativeProtocolError: nativeReview ? !isNativeReviewJson(text, pr) : false,
         };
       }
     } finally {
       progress.flush();
     }
+  }
+
+  // The first export attempt can come back corrupted while the background
+  // service is still flushing a long session; retry once before failing, and
+  // keep the raw output so a persistent failure stays diagnosable.
+  async #exportOpenCodeSession({ settings, workdir, env, signal, sessionId }) {
+    let lastAttempt;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      if (attempt > 1) await delay(2_000, signal);
+      const exported = await runProcess({
+        bin: settings.bin,
+        args: ['session', 'export', sessionId],
+        cwd: workdir,
+        env,
+        timeoutMs: Math.min(this.config.agent.timeoutMs, 60_000),
+        signal,
+        // Export is one JSON document, so retaining only its tail corrupts it.
+        stdoutLimit: 20_000_000,
+      });
+      if (exported.stdoutTruncated) throw new Error('OpenCode session export 超过 2000 万字符，无法完整解析');
+      try {
+        parseJsonDocument(exported.stdout);
+        return exported;
+      } catch (error) {
+        lastAttempt = { exported, error };
+      }
+    }
+    const dumpPath = await dumpExportDiagnostics(sessionId, lastAttempt.exported);
+    throw new Error(`OpenCode export 返回了无效 JSON（session ${sessionId}，原始输出已保存到 ${dumpPath}）`);
   }
 }
 
@@ -1039,6 +1077,22 @@ export function extractOpenCodeSessionId(stdout) {
   return null;
 }
 
+// `opencode run --format json` reports provider/model failures as terminal
+// `error` events on stdout while exiting non-zero, e.g.
+// {"type":"error","error":{"type":"provider.no-route","message":"Model unavailable: ..."}}.
+export function openCodeStreamError(stdout) {
+  let message = null;
+  for (const line of String(stdout).split(/\r?\n/)) {
+    try {
+      const event = JSON.parse(line);
+      if (event?.type !== 'error') continue;
+      const detail = event.error?.message ?? event.message ?? event.error;
+      message = typeof detail === 'string' && detail.trim() ? detail.trim() : '未知错误';
+    } catch {}
+  }
+  return message;
+}
+
 export function parseOpenCodeExport(stdout) {
   let exported;
   try {
@@ -1071,6 +1125,39 @@ function parseJsonDocument(value) {
   const end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));
   if (end < start) throw new Error('incomplete JSON document');
   return JSON.parse(text.slice(start, end + 1));
+}
+
+// Exports occasionally fail while the OpenCode background service is under
+// load; persist the raw output so the failure can be inspected afterwards.
+async function dumpExportDiagnostics(sessionId, exported) {
+  try {
+    const directory = path.join(os.tmpdir(), 'feishu-bot-diagnostics');
+    await fs.mkdir(directory, { recursive: true });
+    const file = path.join(directory, `opencode-export-${sessionId}-${new Date().toISOString().replace(/[:.]/g, '-')}.log`);
+    const body = `--- stdout (${exported.stdout.length} chars) ---\n${exported.stdout}\n--- stderr ---\n${exported.stderr || ''}\n`;
+    await fs.writeFile(file, body);
+    return file;
+  } catch {
+    return '<诊断输出保存失败>';
+  }
+}
+
+function delay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(cancellationError());
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(cancellationError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function collectTextParts(value, output) {

@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 import {
   AgentRunner,
   extractOpenCodeSessionId,
+  openCodeStreamError,
   parseOpenCodeExport,
   parseOpenCodeResult,
   summarizeCodexEvent,
@@ -333,6 +334,122 @@ if (args[0] === 'run') {
   const output = await runner.runInspect({ pr: parsePrUrl('https://gitcode.com/org/repo/pull/9') });
   assert.equal(output.result.status, 'success');
   assert.equal(output.sessionId, 'ses_large');
+});
+
+test('AgentRunner retries a corrupted OpenCode session export once', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'fake-opencode-retry-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const bin = path.join(directory, 'opencode');
+  await fs.writeFile(bin, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === 'run') {
+  process.stdout.write(JSON.stringify({ type: 'step_start', sessionID: 'ses_retry' }) + '\\n');
+  process.exit(1);
+}
+if (args[0] !== 'session' || args[1] !== 'export' || args[2] !== 'ses_retry') process.exit(2);
+const stateFile = ${JSON.stringify(path.join(directory, 'export-calls'))};
+const fs = require('node:fs');
+const calls = Number(fs.existsSync(stateFile) ? fs.readFileSync(stateFile, 'utf8') : 0) + 1;
+fs.writeFileSync(stateFile, String(calls));
+if (calls === 1) {
+  // First export is truncated mid-document while the service is still flushing.
+  process.stdout.write('{"messages":[{"type":"assistant","content":[{"type":"text","text":"{"');
+  process.exit(0);
+}
+const result = JSON.stringify({
+  status: 'success', action: 'inspect', prUrl: 'https://gitcode.com/org/repo/pull/9',
+  unresolvedCount: 0, unresolvedReviewerLogins: [], commentsPosted: 0,
+  commentsReplied: 0, commentsResolved: 0, commitSha: null, summary: 'ok', blockers: [],
+});
+process.stdout.write(JSON.stringify({ messages: [
+  { type: 'assistant', content: [{ type: 'text', text: result }] },
+] }));
+process.exit(0);
+`, { mode: 0o755 });
+  const runner = new AgentRunner({
+    projectRoot,
+    gitcode: { token: 'test-token', apiBase: 'https://api.gitcode.com/api/v5', allowedRepos: new Set(['org/repo']), workdirs: {} },
+    agent: { backend: 'opencode', timeoutMs: 5000, opencode: { bin } },
+  });
+  const output = await runner.runInspect({ pr: parsePrUrl('https://gitcode.com/org/repo/pull/9') });
+  assert.equal(output.result.status, 'success');
+  assert.equal(output.sessionId, 'ses_retry');
+  assert.equal(await fs.readFile(path.join(directory, 'export-calls'), 'utf8'), '2');
+});
+
+test('AgentRunner dumps OpenCode export diagnostics when the retry also fails', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'fake-opencode-dump-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const bin = path.join(directory, 'opencode');
+  await fs.writeFile(bin, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === 'run') {
+  process.stdout.write(JSON.stringify({ type: 'step_start', sessionID: 'ses_broken' }) + '\\n');
+  process.exit(1);
+}
+if (args[0] === 'session' && args[1] === 'export' && args[2] === 'ses_broken') {
+  process.stdout.write('{"messages":[{"type":"assistant","content":[{"type":"text","text":"{"');
+  process.exit(0);
+}
+process.exit(2);
+`, { mode: 0o755 });
+  const runner = new AgentRunner({
+    projectRoot,
+    gitcode: { token: 'test-token', apiBase: 'https://api.gitcode.com/api/v5', allowedRepos: new Set(['org/repo']), workdirs: {} },
+    agent: { backend: 'opencode', timeoutMs: 5000, opencode: { bin } },
+  });
+  let failure;
+  try {
+    await runner.runInspect({ pr: parsePrUrl('https://gitcode.com/org/repo/pull/9') });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure, '任务应因 export 持续失败而报错');
+  assert.match(failure.message, /session ses_broken/);
+  const match = failure.message.match(/已保存到 (.+?)）/);
+  assert.ok(match, '错误信息应包含诊断文件路径');
+  const content = await fs.readFile(match[1], 'utf8');
+  assert.ok(content.includes('--- stdout'), '诊断文件应包含原始 stdout');
+});
+
+test('openCodeStreamError extracts the last terminal error event', () => {
+  const stream = [
+    JSON.stringify({ type: 'step_start', sessionID: 'ses_err', part: { type: 'step-start' } }),
+    JSON.stringify({ type: 'error', sessionID: 'ses_err', error: { type: 'provider.no-route', message: 'Model unavailable: volcengine/deepseek-v4-flash' } }),
+  ].join('\n');
+  assert.equal(extractOpenCodeSessionId(stream), 'ses_err');
+  assert.equal(openCodeStreamError(stream), 'Model unavailable: volcengine/deepseek-v4-flash');
+  assert.equal(openCodeStreamError(JSON.stringify({ type: 'step_start' })), null);
+});
+
+test('AgentRunner reports the stream error instead of repairing a dead OpenCode run', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'fake-opencode-error-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const bin = path.join(directory, 'opencode');
+  await fs.writeFile(bin, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === 'run') {
+  process.stdout.write(JSON.stringify({ type: 'step_start', sessionID: 'ses_dead' }) + '\\n');
+  process.stdout.write(JSON.stringify({ type: 'error', sessionID: 'ses_dead', error: { type: 'provider.no-route', message: 'Model unavailable: volcengine/deepseek-v4-flash' } }) + '\\n');
+  process.exit(1);
+}
+// export 与修复调用都不应发生：直接退出异常码，若被触发会导致不同的报错。
+process.exit(2);
+`, { mode: 0o755 });
+  const runner = new AgentRunner({
+    projectRoot,
+    gitcode: { token: 'test-token', apiBase: 'https://api.gitcode.com/api/v5', allowedRepos: new Set(['org/repo']), workdirs: {} },
+    agent: { backend: 'opencode', timeoutMs: 5000, opencode: { bin } },
+  });
+  await assert.rejects(
+    () => runner.runReview({ pr: parsePrUrl('https://gitcode.com/org/repo/pull/9'), mode: 'initial', reviewerName: '测试bot' }),
+    (error) => {
+      assert.match(error.message, /opencode 模型执行失败: Model unavailable: volcengine\/deepseek-v4-flash/);
+      assert.match(error.message, /session ses_dead/);
+      assert.doesNotMatch(error.message, /findings 数组/);
+      return true;
+    },
+  );
 });
 
 function git(cwd, ...args) {
