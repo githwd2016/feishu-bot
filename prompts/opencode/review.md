@@ -19,7 +19,7 @@ GitCode 操作只能使用 `$REVIEW_BOT_HELPER`，它会校验仓库白名单。
 3. initial 模式：审查全部变更。每个确定问题把最终正文写入临时文件，再以目标代码在新文件中的绝对行号创建 inline comment；GitCode 当前按新文件绝对行号解释 `position`，不得传补丁内偏移：
    `node "$REVIEW_BOT_HELPER" inline "{{PR_URL}}" --path <repo-relative-path> --position <new-file-line> --body-file <file> --confirm-target <owner/repo#number>`
    没有问题时不要制造评论。
-4. rereview 模式：逐条验证未解决 discussion。已修复的先回复验证依据，再 resolve；未修复的保持未解决并回复原因。随后只检查修复引入的新问题：
+4. rereview 模式：读取全部 comments 以及每个 discussion 的完整回复上下文，逐条验证未解决 discussion。回复可能位于 discussion 子评论中，不能只看顶层评论；已明确回复并解决的问题不得重复提出。已修复的先回复验证依据，再 resolve；未修复的保持未解决并回复原因。随后只检查修复引入的新问题：
    - `node "$REVIEW_BOT_HELPER" reply "{{PR_URL}}" --discussion-id <id> --body-file <file> --confirm-target <owner/repo#number>`
    - `node "$REVIEW_BOT_HELPER" resolve "{{PR_URL}}" --discussion-id <id> --confirm-target <owner/repo#number>`
 5. 写操作后重新读取 comments，核对返回的 `path` 和 `diff_position.start_new_line` 是否与预期文件绝对行号一致。若本轮刚创建的评论锚点错误，先补发并验证正确评论，再回复误发 discussion 说明替代关系，然后 resolve 误发 discussion；最终确认只保留有效审查意见为 unresolved。任何鉴权、写入或关键验证失败都返回 blocked，禁止假报成功。

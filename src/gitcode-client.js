@@ -45,10 +45,43 @@ export class GitCodeClient {
         `/repos/${encodeURIComponent(pr.owner)}/${encodeURIComponent(pr.repo)}/pulls/${pr.number}/comments?page=${page}&per_page=100&direction=asc`,
       );
       if (!Array.isArray(batch)) throw new Error('GitCode 评论接口返回了非数组数据');
-      all.push(...batch);
+      for (const comment of batch) {
+        all.push(comment);
+        // GitCode embeds discussion replies in the `reply` field of each root
+        // comment. The /discussions/:id/comments route is POST-only, so never
+        // try to GET it while reading review context.
+        const replies = Array.isArray(comment?.reply)
+          ? comment.reply
+          : Array.isArray(comment?.replies) ? comment.replies : [];
+        const discussionId = comment?.discussion_id
+          ?? comment?.discussionId
+          ?? comment?.discussion?.id;
+        for (const reply of replies) {
+          if (!reply || typeof reply !== 'object') continue;
+          all.push({
+            ...reply,
+            discussion_id: reply.discussion_id ?? reply.discussionId ?? discussionId,
+            parent_comment_id: comment?.id,
+            // Replies inherit the discussion's resolution state because the
+            // API only reports `resolved` on the root comment.
+            ...(reply.resolved === undefined && comment?.resolved !== undefined
+              ? { resolved: comment.resolved } : {}),
+          });
+        }
+      }
       if (batch.length < 100) break;
     }
-    return all;
+
+    // Keep the original order and expose each comment exactly once.
+    const seen = new Set();
+    return all.filter((comment, index) => {
+      const key = comment?.id !== undefined && comment?.id !== null
+        ? `id:${comment.id}`
+        : `index:${index}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   }
 
   async unresolvedComments(pr) {

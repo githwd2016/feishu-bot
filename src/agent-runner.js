@@ -630,6 +630,7 @@ function nativeReviewPrompt({ pr, backend, replacements }) {
 node "$REVIEW_BOT_HELPER" pr "${pr.url}"
 node "$REVIEW_BOT_HELPER" files "${pr.url}"
 node "$REVIEW_BOT_HELPER" comments "${pr.url}"
+复审时必须使用 comments 返回的完整 discussion 上下文（包括子评论/回复）；不能只看顶层评论，已在回复中明确处理的问题不要重复提出。
 禁止使用 WebFetch、browser 或任何网页工具；不要直接访问 PR URL。只操作这个精确 PR。
 发现确定缺陷后不要直接调用网页工具，先把每条 finding 放入 findings；由机器人随后使用 inline helper 发布并验证。
 最终只输出 JSON：{"findings":[{"path":"repo/relative.py","position":123,"body":"确定的缺陷说明"}],"summary":"审查摘要"}。没有问题时 findings 必须为空。`;

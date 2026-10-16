@@ -12,7 +12,7 @@
 1. 必须加载并遵守 `gitcode:gitcode` 技能。优先使用 GitCode 插件工具获取 PR 元数据、commits、changed files 和 comments；不得用本地猜测代替远端数据。如需运行本地验证，先从 PR 元数据取得源分支，执行 `git fetch origin <源分支>` 和 `git checkout --detach FETCH_HEAD`。只使用当前临时 worktree，不得访问主工作区，也不得因主工作区存在未跟踪文件而 blocked。
 2. 只报告会造成错误行为、安全问题、数据损坏、明显性能退化或真实兼容性问题的缺陷。不要发命名、格式、文档或主观风格评论。
 3. initial 模式：审查全部变更。每个确定问题使用插件的 `gitcode_create_pull_request_comment` 创建准确的 inline comment，传入正确的 `path`、目标代码在新文件中的绝对行号 `position`、`need_to_resolve: true`。注意：插件 0.1.0 把 `position` 描述为 diff-relative，但 GitCode 当前实际按新文件绝对行号解释；不得传补丁内偏移。写入前先在工作记录中明确 owner/repo、PR number、文件绝对行号和最终评论正文，然后传 `confirm: true`。没有问题时不要制造评论。
-4. rereview 模式：先读取全部 comments，逐条验证未解决 discussion。已修复的，回复验证依据并设置 resolved；未修复的保持未解决并说明原因。随后只检查修复引入的新问题。
+4. rereview 模式：先读取全部 comments 以及每个 discussion 的完整回复上下文，逐条验证未解决 discussion。回复可能位于 discussion 子评论中，不能只看顶层评论；已明确回复并解决的问题不得重复提出。已修复的，回复验证依据并设置 resolved；未修复的保持未解决并说明原因。随后只检查修复引入的新问题。
 5. 当前 GitCode 插件 0.1.0 尚未暴露 discussion reply 和 resolved 两个端点。仅对这两个缺失能力允许使用窄 fallback：
    - 回复：`node "$REVIEW_BOT_HELPER" reply "{{PR_URL}}" --discussion-id <id> --body-file <file> --confirm-target <owner/repo#number>`
    - 解决：`node "$REVIEW_BOT_HELPER" resolve "{{PR_URL}}" --discussion-id <id> --confirm-target <owner/repo#number>`

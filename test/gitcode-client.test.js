@@ -48,3 +48,33 @@ test('summarizeUnresolvedReviewComments de-duplicates discussions and reviewer l
     unresolvedReviewerLogins: ['lisi', 'wangwu'],
   });
 });
+
+test('GitCodeClient loads embedded discussion replies for rereview context', async (t) => {
+  const originalFetch = globalThis.fetch;
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    return {
+      ok: true, status: 200,
+      text: async () => JSON.stringify([
+        {
+          id: 'c1', discussion_id: 'd1', resolved: false, user: { login: 'reviewer' },
+          reply: [{ id: 'c2', body: '已按建议修复并回复', user: { login: 'author' } }],
+        },
+      ]),
+    };
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  const client = new GitCodeClient({ token: 'secret', apiBase: 'https://api.gitcode.com/api/v5' });
+  const comments = await client.listComments({ owner: 'org', repo: 'repo', number: 9 });
+
+  assert.deepEqual(comments.map((comment) => comment.id), ['c1', 'c2']);
+  assert.equal(urls.length, 1);
+  assert.equal(comments[1].discussion_id, 'd1');
+  assert.equal(comments[1].resolved, false);
+  assert.deepEqual(await client.unresolvedSummary({ owner: 'org', repo: 'repo', number: 9 }), {
+    unresolvedCount: 1,
+    unresolvedReviewerLogins: ['reviewer'],
+  });
+});
