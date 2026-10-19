@@ -3,6 +3,7 @@ import {
   assertAllowedPr,
   prMetadata,
   isPrWip,
+  isPrClosedOrMerged,
   prFromData,
 } from './pr.js';
 import { reviewerFromIdentity } from './workflow.js';
@@ -171,6 +172,10 @@ export class PrScanner {
     const details = await this.client.getPr(pr);
     if (isPrWip(details)) {
       console.log(`[scanner:${this.provider}] 跳过 WIP PR: ${pr.url}`);
+      return null;
+    }
+    if (isPrClosedOrMerged(details)) {
+      console.log(`[scanner:${this.provider}] 跳过已关闭或已合并 PR: ${pr.url}`);
       return null;
     }
     return { pr, details, metadata: prMetadata(details, this.provider) };

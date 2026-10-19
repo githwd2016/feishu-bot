@@ -73,6 +73,23 @@ export function isPrWip(data) {
     || /^\s*\[WIP\](?:\s|$)/i.test(String(data?.title || ''));
 }
 
+// A PR can disappear from the provider's `state=open` listing while an
+// already-dispatched review is still running.  GitCode rejects review writes
+// after merge (HTTP 405), so callers must treat these states as terminal.
+export function isPrClosedOrMerged(data) {
+  if (!data || typeof data !== 'object') return false;
+  if (isPrMerged(data)) return true;
+  const state = String(data.state ?? data.status ?? '').trim().toLowerCase();
+  return ['merged', 'closed', 'rejected'].includes(state);
+}
+
+export function isPrMerged(data) {
+  if (!data || typeof data !== 'object') return false;
+  if (data.merged === true || data.is_merged === true || data.merged_at) return true;
+  const state = String(data.state ?? data.status ?? '').trim().toLowerCase();
+  return state === 'merged';
+}
+
 function makePr(owner, repo, number, provider) {
   return parsePrUrl(`https://${provider}.com/${owner}/${repo}/pull/${number}`);
 }

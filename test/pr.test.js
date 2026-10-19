@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   assertAllowedPr,
   gitcodePrMetadata,
+  isPrClosedOrMerged,
+  isPrMerged,
   isGitCodePrWip,
   parsePrUrl,
   prFromGitCodeData,
@@ -52,6 +54,16 @@ test('GitCode WIP helper accepts API flags and the title marker', () => {
   assert.equal(isGitCodePrWip({ work_in_progress: 'true' }), true);
   assert.equal(isGitCodePrWip({ title: ' [WIP] refactor scanner' }), true);
   assert.equal(isGitCodePrWip({ draft: false, work_in_progress: 0, title: 'Handle WIP labels' }), false);
+});
+
+test('closed and merged PR states are terminal for review dispatch', () => {
+  assert.equal(isPrMerged({ state: 'merged' }), true);
+  assert.equal(isPrMerged({ state: 'closed' }), false);
+  assert.equal(isPrClosedOrMerged({ state: 'merged' }), true);
+  assert.equal(isPrClosedOrMerged({ merged_at: '2026-10-19T08:00:00Z' }), true);
+  assert.equal(isPrClosedOrMerged({ state: 'closed' }), true);
+  assert.equal(isPrClosedOrMerged({ state: 'open', merged: false }), false);
+  assert.equal(isPrClosedOrMerged(null), false);
 });
 
 test('assertAllowedPr rejects repositories outside the allowlist', () => {

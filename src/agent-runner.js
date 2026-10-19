@@ -1,5 +1,5 @@
 import { activeProvider, repositoryConfig } from './repository.js';
-import { assertAllowedPr } from './pr.js';
+import { assertAllowedPr, isPrClosedOrMerged, isPrMerged } from './pr.js';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -231,7 +231,27 @@ export class AgentRunner {
   async #publishNativeFindings({ output, pr, workdir, env, signal }) {
     const findings = output.nativeFindings || [];
     if (findings.length === 0) return output;
+    if (output.result?.status !== 'success') return output;
     const helper = path.join(this.config.projectRoot, 'scripts', 'gitcode-api.js');
+    // The review can outlive the PR's open state.  GitCode returns 405 for
+    // comments on merged/closed PRs; this is a terminal outcome, not a
+    // transient publishing failure that should trigger automatic retries.
+    const prDetails = await this.#loadGitCodePr({ helper, pr, workdir, env, signal });
+    if (isPrClosedOrMerged(prDetails)) {
+      const merged = isPrMerged(prDetails);
+      return {
+        ...output,
+        result: {
+          ...output.result,
+          status: 'success',
+          summary: merged
+            ? 'PR 已合并，审查已结束，无需继续写入 inline comment'
+            : `${output.result.summary || '审查完成'}；PR 已关闭，跳过 inline comment 写入`,
+          blockers: [],
+        },
+        nativeFindings: undefined,
+      };
+    }
     const diffMap = await this.#loadGitCodeDiffMap({ helper, pr, workdir, env, signal });
     let commentsPosted = 0;
     try {
@@ -289,6 +309,18 @@ export class AgentRunner {
         nativeFindings: undefined,
       };
     } catch (error) {
+      if (isMergedReviewWriteError(error)) {
+        return {
+          ...output,
+          result: {
+            ...output.result,
+            status: 'success',
+            summary: 'PR 已合并，审查已结束，无需继续写入 inline comment',
+            blockers: [],
+          },
+          nativeFindings: undefined,
+        };
+      }
       return {
         ...output,
         result: {
@@ -297,6 +329,28 @@ export class AgentRunner {
           blockers: [...new Set([...(output.result.blockers || []), `inline comment 写入或验证失败: ${oneLine(error.message)}`])],
         },
       };
+    }
+  }
+
+  async #loadGitCodePr({ helper, pr, workdir, env, signal }) {
+    const result = await runProcess({
+      bin: process.execPath,
+      args: [helper, 'pr', pr.url],
+      cwd: workdir,
+      env,
+      timeoutMs: Math.min(this.config.agent.timeoutMs, 60_000),
+      signal,
+    });
+    if (result.stdoutTruncated) throw new Error('GitCode PR 输出超过限制，无法完整解析');
+    try {
+      const details = JSON.parse(result.stdout);
+      if (!details || typeof details !== 'object' || Array.isArray(details)) {
+        throw new Error('GitCode PR 返回了非对象数据');
+      }
+      return details;
+    } catch (error) {
+      if (error.message.startsWith('GitCode PR 返回了')) throw error;
+      throw new Error('GitCode PR 返回了无效 JSON');
     }
   }
 
@@ -604,6 +658,12 @@ ${previousText.slice(-30_000)}
     const dumpPath = await dumpExportDiagnostics(sessionId, lastAttempt.exported);
     throw new Error(`OpenCode export 返回了无效 JSON（session ${sessionId}，原始输出已保存到 ${dumpPath}）`);
   }
+}
+
+function isMergedReviewWriteError(error) {
+  const message = String(error?.message || error || '').toLowerCase();
+  return /(?:\b405\b|method not allowed)/.test(message)
+    && /(?:merge request|pull request|pr).{0,80}(?:merged|合并)|(?:review|comment).{0,80}(?:after being merged|合并后)/.test(message);
 }
 
 function openCodeRunArgs(settings) {
