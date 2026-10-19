@@ -593,6 +593,39 @@ test('startup recovery turns an interrupted external bot review into a retryable
   assert.equal(context.sent[0][2][0].openId, LISI.botOpenId);
 });
 
+test('bare reviewer PR links use current GitCode comments as completion evidence', async (t) => {
+  const context = await makeContext(t);
+  const pr = parsePrUrl('https://gitcode.com/org/repo/pull/7');
+  const baseState = {
+    key: pr.key, url: pr.url, chatId: 'chat', requesterOpenId: SELF.feishuOpenId,
+    requesterName: SELF.displayName, phase: 'awaiting_review', cycle: 0,
+    pending: { [LISI.gitcodeLogin]: 'pending' },
+    reviewers: [{ id: LISI.gitcodeLogin, gitcodeLogin: LISI.gitcodeLogin, openId: LISI.botOpenId, name: 'lisi bot' }],
+  };
+  await context.store.putPr(baseState);
+  const workflow = makeWorkflow(context, {
+    gitcode: {
+      getPr: async () => ({ state: 'open' }),
+      listComments: async () => [{ user: { login: LISI.gitcodeLogin }, body: 'review finding' }],
+      unresolvedSummary: async () => ({ unresolvedCount: 0, unresolvedReviewerLogins: [] }),
+    },
+  });
+  await workflow.onFeishuMessage(message({
+    messageId: 'bare-result-with-comment', senderOpenId: LISI.botOpenId, senderType: 'app', text: `@何伟栋分身 ${pr.url}`,
+  }));
+  assert.equal(context.store.getPr(pr.key).pending[LISI.gitcodeLogin], 'done');
+
+  const noCommentContext = await makeContext(t);
+  await noCommentContext.store.putPr(baseState);
+  const waitingWorkflow = makeWorkflow(noCommentContext, {
+    gitcode: { getPr: async () => ({ state: 'open' }), listComments: async () => [] },
+  });
+  await waitingWorkflow.onFeishuMessage(message({
+    messageId: 'bare-result-without-comment', senderOpenId: LISI.botOpenId, senderType: 'app', text: `@何伟栋分身 ${pr.url}`,
+  }));
+  assert.equal(noCommentContext.store.getPr(pr.key).pending[LISI.gitcodeLogin], 'pending');
+});
+
 test('review protocol and third-party result compatibility remain supported', () => {
   const marker = buildReviewBotProtocol({ action: 'result', mode: 'rereview', cycle: 3, status: 'failed' });
   assert.deepEqual(parseReviewBotProtocol(marker), {

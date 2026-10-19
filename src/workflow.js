@@ -1,5 +1,5 @@
 import { activeProvider, repositoryConfig, identityLogin, identityByLogin } from './repository.js';
-import { assertAllowedPr, prMetadata, parsePrUrl } from './pr.js';
+import { assertAllowedPr, isPrClosedOrMerged, prMetadata, parsePrUrl } from './pr.js';
 import { KeyedQueue } from './keyed-queue.js';
 import { PROGRESS_HEARTBEAT_MS } from './progress.js';
 import {
@@ -309,12 +309,21 @@ export class ReviewWorkflow {
       } else {
         const linkedPr = parsePrUrl(event.text);
         const compatibleResult = parseCompatibleReviewBotResult(event.text);
-        if (!linkedPr || linkedPr.key !== pr.key || !compatibleResult) {
+        if (!linkedPr || linkedPr.key !== pr.key) {
           console.warn(`[workflow] 忽略 ${reviewer.id} 缺少结果标记的消息`);
           return;
         }
-        success = compatibleResult.status === 'success';
-        console.warn(`[workflow] 接收 ${reviewer.id} 的第三方兼容结果 status=${compatibleResult.status} pr=${pr.key}`);
+        if (compatibleResult) {
+          success = compatibleResult.status === 'success';
+          console.warn(`[workflow] 接收 ${reviewer.id} 的第三方兼容结果 status=${compatibleResult.status} pr=${pr.key}`);
+        } else {
+          success = await this.#inferReviewerCompletion(pr, reviewer);
+          if (success === null) {
+            console.warn(`[workflow] 忽略 ${reviewer.id} 缺少结果标记的消息，当前 PR 尚无该 reviewer 评论`);
+            return;
+          }
+          console.warn(`[workflow] 根据 GitCode 当前状态接收 ${reviewer.id} 的审查结果 pr=${pr.key}`);
+        }
       }
       await this.#recordReviewerOutcome(pr, reviewer.id, success,
         success ? undefined : `审查机器人 ${reviewer.name} 报告执行失败`);
@@ -384,6 +393,29 @@ export class ReviewWorkflow {
       [this.#person(event.senderOpenId, '操作人')]);
     await this.#processReviewRound(pr, confirmed, { completionAnnounced: true });
     return { confirmed: true, skippedReviewers: pendingCount };
+  }
+
+  async #inferReviewerCompletion(pr, reviewer) {
+    try {
+      const details = await this.client.getPr(pr);
+      if (isPrClosedOrMerged(details)) return true;
+      const comments = await this.client.listComments(pr);
+      const login = String(reviewer.gitcodeLogin || reviewer.githubLogin || reviewer.id || '').toLowerCase();
+      if (!login) return null;
+      const hasReviewerComment = comments.some((comment) => {
+        const author = comment?.user?.login
+          ?? comment?.user?.username
+          ?? comment?.author?.login
+          ?? comment?.author?.username
+          ?? comment?.creator?.login
+          ?? comment?.creator?.username;
+        return String(author || '').trim().toLowerCase() === login;
+      });
+      return hasReviewerComment ? true : null;
+    } catch (error) {
+      console.warn(`[workflow] 无法根据 GitCode 当前状态判断 ${reviewer.id} 的结果: ${safeError(error)}`);
+      return null;
+    }
   }
 
   async #recordReviewerOutcome(pr, reviewerId, success, error) {
