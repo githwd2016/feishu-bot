@@ -269,6 +269,57 @@ test('plain initial requests replay completed results until the head SHA changes
   assert.ok(context.sent.some((item) => /action=result mode=initial cycle=1 status=success/.test(String(item[1]))));
 });
 
+test('completed review replays report the live unresolved state instead of the stored result', async (t) => {
+  const context = await makeContext(t);
+  let unresolvedCount = 1;
+  let summaryFailures = 0;
+  let reviewCalls = 0;
+  const workflow = makeWorkflow(context, {
+    gitcode: {
+      getPr: async () => prDetails({ author: 'lisi', assignees: [], sha: 'sha-1' }),
+      unresolvedSummary: async () => {
+        if (summaryFailures > 0) throw new Error('API down');
+        return { unresolvedCount, unresolvedReviewerLogins: unresolvedCount ? ['lisi'] : [] };
+      },
+    },
+    agent: {
+      runReview: async () => {
+        reviewCalls += 1;
+        return { durationMs: 1000, result: { unresolvedCount: 1 } };
+      },
+    },
+  });
+  const request = (messageId) => message({
+    messageId, senderOpenId: LISI.botOpenId, senderType: 'app',
+    text: '请审查：https://gitcode.com/org/repo/pull/9',
+  });
+
+  await workflow.onFeishuMessage(request('refresh-initial'));
+  assert.equal(reviewCalls, 1);
+
+  // Still unresolved: the replay reflects the current count without re-running the agent.
+  await workflow.onFeishuMessage(request('refresh-unresolved'));
+  assert.equal(reviewCalls, 1);
+  assert.ok(context.sent.some((item) => /当前有 1 条待处理 inline comments/.test(String(item[1]))));
+
+  // The author resolves the discussion on GitCode; no head SHA change. The
+  // next ping must not replay the stale "1 条待处理" result.
+  unresolvedCount = 0;
+  await workflow.onFeishuMessage(request('refresh-resolved'));
+  assert.equal(reviewCalls, 1);
+  assert.ok(context.sent.some((item) => /均已解决，可以合入/.test(String(item[1]))));
+
+  // The refreshed result is persisted: when the live check fails, the last
+  // known message is replayed, not the original stale one.
+  const pendingReplays = context.sent.filter((item) => /当前有 1 条待处理 inline comments/.test(String(item[1]))).length;
+  assert.equal(pendingReplays, 2); // original result + one live replay
+  summaryFailures = 1;
+  await workflow.onFeishuMessage(request('refresh-api-down'));
+  assert.equal(reviewCalls, 1);
+  assert.equal(context.sent.filter((item) => /当前有 1 条待处理 inline comments/.test(String(item[1]))).length, pendingReplays);
+  assert.equal(context.sent.filter((item) => /均已解决，可以合入/.test(String(item[1]))).length, 2);
+});
+
 test('plain rereview cycles advance only when mode or head SHA changes', async (t) => {
   const context = await makeContext(t);
   let headSha = 'sha-1';

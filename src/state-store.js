@@ -170,6 +170,21 @@ export class StateStore {
     });
   }
 
+  async updateExternalReviewResult(key, resultMessage) {
+    return this.#mutate((state) => {
+      const current = state.externalReviewRequests[key];
+      if (!current || typeof current !== 'object') return null;
+      if (current.status !== 'completed') return null;
+      const next = {
+        ...current,
+        resultMessage,
+        updatedAt: new Date().toISOString(),
+      };
+      state.externalReviewRequests[key] = next;
+      return structuredClone(next);
+    });
+  }
+
   async cancelExternalReviewRequest(request, resultMessage) {
     return this.#mutate((state) => {
       const key = request?.key;

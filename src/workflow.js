@@ -528,11 +528,35 @@ export class ReviewWorkflow {
         `该 PR 已在${mode === 'rereview' ? '复审' : '审查'}处理中（cycle ${claim.record.cycle}）：${pr.url}`,
         requesterIsBot ? [] : [requester]);
     } else if (claim.record.resultMessage) {
-      await this.feishu.send(event.chatId, claim.record.resultMessage, [requester]);
+      // The stored result reflects the review's end time; the discussion state
+      // can move on afterwards (author replies or resolves threads) without
+      // the head SHA changing. Re-check the provider before replaying so a
+      // resolved PR is not reported as still having pending comments.
+      const message = claim.record.status === 'completed'
+        ? await this.#currentExternalReviewResult(pr, claim.record)
+        : claim.record.resultMessage;
+      await this.feishu.send(event.chatId, message, [requester]);
     } else {
       await this.#sendProgress(event.chatId, `该 PR 本轮审查已完成：${pr.url}`, [requester]);
     }
     return null;
+  }
+
+  async #currentExternalReviewResult(pr, record) {
+    try {
+      const summary = await this.client.unresolvedSummary(pr);
+      const marker = buildReviewBotProtocol({
+        action: 'result', mode: record.mode, cycle: record.cycle, status: 'success',
+      });
+      const message = summary.unresolvedCount > 0
+        ? `${marker} 当前有 ${summary.unresolvedCount} 条待处理 inline comments：${record.prUrl}`
+        : `${marker} 当前所有 review comments 均已解决，可以合入：${record.prUrl}`;
+      await this.store.updateExternalReviewResult(record.key, message);
+      return message;
+    } catch (error) {
+      console.warn(`[workflow] 无法刷新 ${record.prKey} 的审查结果，沿用上次消息: ${safeError(error)}`);
+      return record.resultMessage;
+    }
   }
 
   async #reviewForExternalRequester(pr, event, protocol, request) {

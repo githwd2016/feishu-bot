@@ -97,6 +97,41 @@ test('failed external review requests are retryable while successful results sta
   assert.equal(duplicate.record.attempts, 2);
 });
 
+test('updateExternalReviewResult only refreshes completed records', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'review-state-refresh-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new StateStore(path.join(directory, 'state.json'));
+  await store.load();
+  const request = {
+    prKey: 'a/b#2b', prUrl: 'https://gitcode.com/a/b/pull/2b', chatId: 'c1',
+    requesterOpenId: 'bot', mode: 'initial', cycle: 0, headSha: 'sha-refresh',
+  };
+
+  const first = await store.claimExternalReviewRequest(request);
+  await store.completeExternalReviewRequest(
+    first.record,
+    '[review-bot action=result mode=initial cycle=0 status=success] 1 条待处理',
+  );
+
+  const refreshed = await store.updateExternalReviewResult(first.record.key, 'all resolved');
+  assert.equal(refreshed.resultMessage, 'all resolved');
+  assert.equal((await store.claimExternalReviewRequest(request)).record.resultMessage, 'all resolved');
+
+  // A failed result is retryable: the same key moves back to running. A stale
+  // refresh must not clobber a record that is no longer completed.
+  await store.completeExternalReviewRequest(
+    first.record,
+    '[review-bot action=result mode=initial cycle=0 status=failed] boom',
+    { success: false },
+  );
+  const retry = await store.claimExternalReviewRequest(request);
+  assert.equal(retry.claimed, true);
+  assert.equal(retry.record.status, 'running');
+  assert.equal(await store.updateExternalReviewResult(retry.record.key, 'stale'), null);
+  assert.equal((await store.claimExternalReviewRequest(request)).record.status, 'running');
+  assert.equal(await store.updateExternalReviewResult('["missing-key"]', 'x'), null);
+});
+
 test('legacy completed failure records are recognized as retryable', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'review-state-legacy-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
