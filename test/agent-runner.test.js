@@ -102,6 +102,7 @@ test('AgentRunner supports the OpenCode JSON event backend', async (t) => {
 const args = process.argv.slice(2);
 const prompt = args[args.length - 1];
 if (!args.includes('run') || args[args.indexOf('--format') + 1] !== 'json') process.exit(2);
+if (!args.includes('--standalone')) process.exit(7);
 if (args.includes('--dir') || args.includes('--variant')) process.exit(3);
 if (args[args.indexOf('--model') + 1] !== 'provider/model#high') process.exit(4);
 if (args[args.indexOf('--agent') + 1] !== 'reviewer' || !args.includes('--auto')) process.exit(5);
@@ -473,11 +474,18 @@ function codexRunner(bin, timeoutMs) {
 test('GitHub tasks select GitHub prompts, helper and credentials for both agent backends', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'github-agent-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const originalPwd = process.env.PWD;
+  process.env.PWD = projectRoot;
+  t.after(() => {
+    if (originalPwd === undefined) delete process.env.PWD;
+    else process.env.PWD = originalPwd;
+  });
   const fakeAgent = path.join(directory, 'agent');
   await fs.writeFile(fakeAgent, `#!/usr/bin/env node
 const fs = require('node:fs');
 const args = process.argv.slice(2);
 function finish(prompt) {
+  if (args[0] === 'run' && (!process.env.PWD || fs.realpathSync(process.env.PWD) !== process.cwd())) process.exit(8);
   if (!prompt.includes('https://github.com/org/repo/pull/9') || prompt.includes('{{')) process.exit(2);
   if (!process.env.REVIEW_BOT_HELPER.endsWith('/scripts/github-api.js')) process.exit(3);
   if (process.env.GITHUB_TOKEN !== 'gh-test' || process.env.GITCODE_TOKEN || process.env.GH_TOKEN) process.exit(4);

@@ -57,7 +57,7 @@ export class AgentRunner {
   async runWeeklySummary({ prompt }) {
     const startedAt = Date.now();
     const workdir = this.config.projectRoot;
-    const env = this.#environment(false);
+    const env = this.#environment(false, workdir);
     const output = this.config.agent.backend === 'codex'
       ? await this.#runCodexText({ prompt, workdir, env })
       : this.config.agent.backend === 'claude'
@@ -170,7 +170,7 @@ export class AgentRunner {
       const schema = await fs.readFile(path.join(this.config.projectRoot, 'schemas', 'agent-result.schema.json'), 'utf8');
       prompt += `\n\n最终结果必须符合以下 JSON Schema，所有 required 字段均须填写：\n${schema}`;
     }
-    const env = this.#environment(usesWorktree);
+    const env = this.#environment(usesWorktree, workdir);
     console.log(`[agent:${backend}] 开始 ${taskName} ${pr.key} cwd=${workdir} timeout=${formatDuration(this.config.agent.timeoutMs)}`);
     const heartbeat = setInterval(() => {
       const elapsed = Date.now() - startedAt;
@@ -380,9 +380,11 @@ ${previousText.slice(-30_000)}
     }
   }
 
-  #environment(usesWorktree) {
+  #environment(usesWorktree, workdir) {
     const prefix = this.provider.toUpperCase();
     const env = { ...process.env };
+    // OpenCode 2.2.5 uses PWD to select the session directory even in standalone mode.
+    if (this.config.agent.backend === 'opencode') env.PWD = workdir;
     // Do not pass credentials for the inactive platform to the task process.
     for (const key of ['GITCODE_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN']) delete env[key];
     return {
@@ -605,7 +607,10 @@ ${previousText.slice(-30_000)}
 }
 
 function openCodeRunArgs(settings) {
-  const args = ['run', '--format', 'json'];
+  // 强制私有 server：默认模式 opencode run 接入常驻后台 server，任务会被
+  // 重定向到 server 最近活跃的项目（可能是机器人主工作区），agent 随之在
+  // 主工作区执行 checkout 等操作。会话目录还需要通过 PWD 对齐。
+  const args = ['run', '--standalone', '--format', 'json'];
   if (settings.variant && !settings.model) {
     throw new Error('OPENCODE_VARIANT 需要同时配置 OPENCODE_MODEL');
   }

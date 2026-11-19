@@ -152,6 +152,8 @@ OPENCODE_VARIANT=high
 OPENCODE_AUTO_APPROVE=true
 ```
 
+OpenCode 任务以 `--standalone` 启动私有 server，并将子进程的 `PWD` 和 `cwd` 都设为任务目录。OpenCode 2.2.5 即使使用私有 server，也可能根据继承的 `PWD` 选中机器人自己的工作目录。
+
 Claude Code：
 
 ```dotenv
@@ -309,7 +311,7 @@ GitCode created_by_me
 ## 安全边界与排障
 
 - 所有 PR 必须属于对应平台的 `GITCODE_ALLOWED_REPOS` 或 `GITHUB_ALLOWED_REPOS`；
-- `REPO_WORKDIRS_JSON` 必须使用仓库根目录的绝对路径，只用于创建临时 detached worktree；
+- `REPO_WORKDIRS_JSON` 必须使用仓库根目录的绝对路径，只用于创建临时 detached worktree；OpenCode 任务以 `--standalone` 启动，防止被常驻后台 server 重定向到主工作区；
 - helper 写操作会再次校验精确的仓库和 PR；
 - 服务不会 force push，也不会自动合并；
 - PAT、`.env` 和状态文件不得提交到 Git。
